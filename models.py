@@ -9,6 +9,7 @@
 import time
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
+from sqlalchemy import BigInteger, Boolean, Float, Integer, Numeric
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -365,73 +366,195 @@ _CARRY_COLUMNS = (
 )
 
 
-async def _migrate_legacy() -> None:
-    """把「一个用户一行 + 目标列表」的旧数据拆成「一个目标一行」（幂等）。"""
-    table = WavesStaminaNotice.__tablename__
+def _index_names(sync_conn, name: str) -> List[str]:
+    insp = sa_inspect(sync_conn)
+    try:
+        return [i["name"] for i in insp.get_indexes(name) if i.get("name")]
+    except Exception:
+        return []
+
+
+def _fallback_value(column) -> Any:
+    """列缺省值，用于旧行补空。"""
+    default = column.default
+    if default is not None and getattr(default, "is_scalar", False):
+        return default.arg
+    if isinstance(column.type, (Integer, BigInteger, Boolean)):
+        return 0
+    if isinstance(column.type, (Float, Numeric)):
+        return 0.0
+    return ""
+
+
+def _split_targets(row: Dict[str, Any]) -> List[tuple]:
+    """旧行 -> 若干 (target_type, target_id)。"""
+    targets: List[tuple] = []
+    private_flag = row.get("push_private") or 0
+    legacy_target = str(row.get("push_target") or "").strip()
+    if private_flag or legacy_target == "private":
+        targets.append((TARGET_PRIVATE, ""))
+    raw_groups = row.get("group_ids") or ""
+    if not raw_groups and legacy_target == "group":
+        raw_groups = row.get("group_id") or ""
+    for group_id in str(raw_groups).split(","):
+        group_id = group_id.strip()
+        if group_id:
+            targets.append((TARGET_GROUP, group_id))
+    return targets
+
+
+def _build_row(
+    columns, source: Dict[str, Any], target_type: str, target_id: str
+) -> Dict[str, Any]:
+    """按模型列拼一行新数据。"""
+    row: Dict[str, Any] = {}
+    for column in columns:
+        name = column.name
+        if name == "id":
+            continue
+        if name == "target_type":
+            row[name] = target_type
+            continue
+        if name == "target_id":
+            row[name] = target_id or ""
+            continue
+        value = source.get(name)
+        if value is None:
+            value = _fallback_value(column)
+        row[name] = value
+    return row
+
+
+async def _normalize_table() -> None:
+    """把旧表结构彻底换成新表结构：拆目标 + 删除废弃的 NOT NULL 旧列。
+
+    旧表里的 ``push_target`` / ``group_id`` 等列是 ``NOT NULL`` 且没有默认值，
+    新模型已经不写这些列，因此只要它们还在表里，任何 INSERT 都会被
+    ``NOT NULL constraint failed`` 拒绝。SQLite 不支持修改列约束，
+    只能重建表。
+    """
+    table_name = WavesStaminaNotice.__tablename__
+    table = WavesStaminaNotice.__table__  # type: ignore[attr-defined]
+    columns = list(table.columns)
+    model_cols = [c.name for c in columns]
+
     async with engine.connect() as conn:
-        existing = await conn.run_sync(_table_columns, table)
+        existing = await conn.run_sync(_table_columns, table_name)
+        dialect = conn.dialect.name
     if not existing:
         return
-    legacy = [c for c in _LEGACY_COLUMNS if c in existing]
-    if not legacy or "target_type" not in existing:
+
+    legacy = [c for c in existing if c not in model_cols]
+    if not legacy:
         return
 
-    select_cols = ["id", "user_id", "bot_id", "uid"] + [
-        c for c in _CARRY_COLUMNS if c in existing
-    ] + legacy
-    quoted = ", ".join(f'"{c}"' for c in select_cols)
-    sql = (
-        f'SELECT {quoted} FROM "{table}" '
-        f"WHERE COALESCE(target_type, '') NOT IN ('private', 'group')"
-    )
+    logger.info(f"[鸣潮体力提醒] 检测到旧列 {legacy}，开始重建表 {table_name}")
+
+    # 1. 旧数据全部读进内存，顺便算出拆分后的行
+    quoted = ", ".join(f'"{c}"' for c in existing)
     async with engine.connect() as conn:
-        result = await conn.execute(text(sql))
-        rows = [dict(r._mapping) for r in result.fetchall()]
-    if not rows:
-        return
+        result = await conn.execute(text(f'SELECT {quoted} FROM "{table_name}"'))
+        old_rows = [dict(r._mapping) for r in result.fetchall()]
 
-    logger.info(f"[鸣潮体力提醒] 发现 {len(rows)} 行旧数据，开始拆分推送目标")
+    new_rows: List[Dict[str, Any]] = []
+    seen = set()
+    skipped = 0
+    for row in old_rows:
+        target_type = str(row.get("target_type") or "").strip()
+        if target_type in TARGET_TYPES:
+            candidates = [(target_type, str(row.get("target_id") or ""))]
+        else:
+            candidates = _split_targets(row)
+        if not candidates:
+            skipped += 1
+            continue
+        for t_type, t_id in candidates:
+            built = _build_row(columns, row, t_type, t_id)
+            key = (
+                built.get("user_id") or "",
+                built.get("bot_id") or "",
+                built.get("uid") or "",
+                t_type,
+                t_id or "",
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            new_rows.append(built)
 
-    for row in rows:
-        user_id = row.get("user_id") or ""
-        bot_id = row.get("bot_id") or ""
-        uid = row.get("uid") or ""
-        carry = {c: row.get(c) for c in _CARRY_COLUMNS if c in row}
-
-        targets: List[tuple] = []
-        private_flag = row.get("push_private") or 0
-        legacy_target = row.get("push_target") or ""
-        if private_flag or legacy_target == "private":
-            targets.append((TARGET_PRIVATE, ""))
-        raw_groups = row.get("group_ids") or ""
-        if not raw_groups and legacy_target == "group":
-            raw_groups = row.get("group_id") or ""
-        for group_id in [g.strip() for g in str(raw_groups).split(",")]:
-            if group_id:
-                targets.append((TARGET_GROUP, group_id))
-
-        for target_type, target_id in targets:
+    # 2. 换表结构
+    if dialect == "sqlite":
+        tmp = f"{table_name}__legacy"
+        async with engine.begin() as conn:
+            await conn.execute(text(f'DROP TABLE IF EXISTS "{tmp}"'))
+            await conn.execute(text(f'ALTER TABLE "{table_name}" RENAME TO "{tmp}"'))
+        # 索引名在 SQLite 里是全局的，先摘掉，否则新表建索引会重名
+        async with engine.connect() as conn:
+            names = await conn.run_sync(_index_names, tmp)
+        for name in names:
             try:
-                await WavesStaminaNotice.upsert_row(
-                    user_id,
-                    bot_id,
-                    uid,
-                    target_type,
-                    target_id,
-                    **carry,
-                )
+                async with engine.begin() as conn:
+                    await conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
             except Exception as e:
-                logger.warning(
-                    f"[鸣潮体力提醒] 迁移 {uid} -> {target_type}:{target_id} 失败: {e}"
-                )
+                logger.debug(f"[鸣潮体力提醒] 删除旧索引 {name} 跳过: {e}")
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda c: SQLModel.metadata.create_all(c, tables=[table]))
+        logger.info("[鸣潮体力提醒] 新表已创建，准备回写数据")
+    else:
+        for name in legacy:
+            try:
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text(f'ALTER TABLE "{table_name}" DROP COLUMN "{name}"')
+                    )
+            except Exception as e:
+                logger.warning(f"[鸣潮体力提醒] 删除旧列 {name} 失败: {e}")
+        # 老版本 MySQL 不支持 DROP COLUMN 时，宁可不动数据也不要写坏
+        async with engine.connect() as conn:
+            still = await conn.run_sync(_table_columns, table_name)
+        left = [c for c in (still or []) if c not in model_cols]
+        if left:
+            logger.warning(
+                f"[鸣潮体力提醒] 旧列 {left} 未能删除，跳过数据迁移以保护现有数据；"
+                "请手动重建该表后再启动"
+            )
+            return
 
+    # 3. 回写
+    async with engine.begin() as conn:
+        await conn.execute(text(f'DELETE FROM "{table_name}"'))
+    await _insert_rows(table_name, columns, new_rows)
+
+    # 4. 丢掉旧表
+    if dialect == "sqlite":
         try:
             async with engine.begin() as conn:
-                await conn.execute(
-                    text(f'DELETE FROM "{table}" WHERE id = :rid'), {"rid": row["id"]}
-                )
+                await conn.execute(text(f'DROP TABLE IF EXISTS "{tmp}"'))
         except Exception as e:
-            logger.warning(f"[鸣潮体力提醒] 删除旧行 {row['id']} 失败: {e}")
+            logger.warning(f"[鸣潮体力提醒] 删除旧表失败: {e}")
+
+    logger.info(
+        f"[鸣潮体力提醒] 重建完成：读入 {len(old_rows)} 行，"
+        f"写入 {len(new_rows)} 行，丢弃 {skipped} 行无效数据"
+    )
+
+
+async def _insert_rows(table_name: str, columns, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    names = [c.name for c in columns if c.name != "id"]
+    cols_sql = ", ".join('"' + n + '"' for n in names)
+    sql = (
+        f'INSERT INTO "{table_name}" ({cols_sql}) '
+        f'VALUES ({", ".join(":" + n for n in names)})'
+    )
+    for i in range(0, len(rows), 200):
+        chunk = rows[i : i + 200]
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(sql), chunk)
+        except Exception as e:
+            logger.warning(f"[鸣潮体力提醒] 回写 {len(chunk)} 行失败: {e}")
 
 
 async def _dedupe_and_index() -> None:
@@ -479,12 +602,12 @@ async def _log_stats() -> None:
 
 
 async def ensure_tables() -> None:
-    """建表 + 补列 + 旧数据拆分 + 唯一索引（全部幂等）。"""
+    """建表 + 补列 + 旧表重建（拆目标、去废弃列）+ 唯一索引（全部幂等）。"""
     table = WavesStaminaNotice.__table__  # type: ignore[attr-defined]
     async with engine.begin() as conn:
         await conn.run_sync(lambda c: SQLModel.metadata.create_all(c, tables=[table]))
     await _add_missing_columns(table)
-    await _migrate_legacy()
+    await _normalize_table()
     await _dedupe_and_index()
     await _log_stats()
 
