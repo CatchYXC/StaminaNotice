@@ -134,7 +134,6 @@ async def open_notice(bot: Bot, ev: Event):
         last_error="",
     )
 
-    prefix = xw_bridge.xw_prefix()
     lines = [
         f"✅ 已开启{label}体力提醒\n",
         f"🕒 当前体力：{cur}，阈值：{threshold}\n",

@@ -25,7 +25,7 @@ from gsuid_core.logger import logger
 from . import stamina_config as cfg
 from .models import WavesStaminaNotice
 from .sender import send_push
-from .xw_bridge import fetch_energy, xw_prefix
+from .xw_bridge import fetch_energy
 
 POINT_SECONDS = 360  # 鸣潮体力：每 6 分钟恢复 1 点
 CAP_DEFAULT = 240
@@ -51,7 +51,6 @@ def compute_next_check(
 
 
 def _build_text(record: WavesStaminaNotice, cur: int, threshold: int, crazy: bool) -> str:
-    prefix = xw_prefix()
     head = "🔥[鸣潮] 催命提醒" if crazy else "✅[鸣潮] 体力提醒"
     lines = [
         f"{head}\n",
@@ -181,11 +180,37 @@ async def tick() -> None:
             await asyncio.sleep(0.3)
 
 
-@scheduler.scheduled_job(
-    "interval",
-    minutes=cfg.check_minutes(),
-    id="stamina_notice_push",
-)
 async def _scheduled_tick() -> None:
     """每6分钟检查体力是否达到设定阈值"""
     await tick()
+
+
+def _register_job() -> None:
+    """注册定时任务。
+
+    这里故意不用 ``@scheduler.scheduled_job(id=...)`` 装饰器：
+    那个写法在**插件热重载**时会因为 job id 重复抛 ``ConflictingIdError``，
+    而 ``push_engine`` 在 ``__init__.py`` 里比 ``commands`` 先导入，
+    一旦这里抛异常，后面的指令模块就整个不会被加载 —— 表现就是「所有指令都没反应」。
+    改成 ``add_job(replace_existing=True)`` 并捕获异常，重载多少次都安全。
+    """
+    try:
+        scheduler.add_job(
+            _scheduled_tick,
+            "interval",
+            minutes=cfg.check_minutes(),
+            id="stamina_notice_push",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.debug(
+            f"[鸣潮体力提醒] 定时任务已注册（每 {cfg.check_minutes()} 分钟）"
+        )
+    except Exception as e:
+        logger.warning(
+            f"[鸣潮体力提醒] 注册定时任务失败，提醒将不会自动触发：{type(e).__name__}: {e}"
+        )
+
+
+_register_job()
