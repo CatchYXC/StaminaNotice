@@ -1,28 +1,31 @@
-"""StaminaNotice 自建数据表。
+"""StaminaNotice 自建数据表（一行 = 一个推送目标）。
 
-刻意不复用 XutheringWavesUID 的 WavesStaminaRecord：
-那张表由 XutheringWavesUID 的「每日」和后台 Admin 写入，外部插件插写会与它的
-upsert 抢行、语义也会串（它的 stamina_push_switch 既表示开关又表示群号）。
+数据模型
+--------
+不再用「一个用户一行 + 目标列表」的写法，改成**一个目标一行**：
 
-推送目标设计
-------------
-一个人可以**同时**在私聊和多个群里收提醒，所以目标不是互斥的单值：
+* 一行 ``target_type='private', target_id=''`` —— 私聊推送
+* 一行 ``target_type='group',   target_id='群号'`` —— 某个群的推送
 
-* ``push_private`` —— 私聊推送开关（0/1）
-* ``group_ids``    —— 群号列表，逗号分隔，支持一人多群
+这样每个人在同一个群里开的提醒、在私聊开的提醒，各自有自己的阈值、
+催命状态、下次检查时间、推送计数，互不影响；群里的设置只改群里的那行，
+私聊的设置只改私聊那行，查询和排障也都只面对一条扁平记录。
 
-``push_target`` / ``group_id`` 是 v1 的单目标遗留字段，仅用于兼容旧行读取；
-新写入不再依赖它们（改动时仍会一起置为 off，避免旧逻辑复活）。
+唯一键：``(user_id, bot_id, uid, target_type, target_id)``
+
+刻意不复用 XutheringWavesUID 的 WavesStaminaRecord：那张表由它的「每日」
+和后台 Admin 写入，外部插件插写会与它的 upsert 抢行、语义也会串
+（它的 stamina_push_switch 既表示开关又表示群号）。
 """
 
 import time
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
-from sqlmodel import Field, SQLModel, col, select
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text, update
-from sqlalchemy.sql import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import and_, func
+from sqlmodel import Field, SQLModel, col, select
 
 from gsuid_core.logger import logger
 from gsuid_core.utils.database.base_models import (
@@ -33,27 +36,13 @@ from gsuid_core.utils.database.base_models import (
 
 T_Notice = TypeVar("T_Notice", bound="WavesStaminaNotice")
 
-# 遗留字段取值（仅兼容旧数据）
-TARGET_OFF = "off"
 TARGET_PRIVATE = "private"
 TARGET_GROUP = "group"
-
-
-def _split_groups(raw: str) -> List[str]:
-    return [g.strip() for g in (raw or "").split(",") if g.strip()]
-
-
-def _join_groups(groups: List[str]) -> str:
-    seen: List[str] = []
-    for g in groups:
-        g = g.strip()
-        if g and g not in seen:
-            seen.append(g)
-    return ",".join(seen)
+TARGET_TYPES = (TARGET_PRIVATE, TARGET_GROUP)
 
 
 class WavesStaminaNotice(BaseModel, table=True):
-    """体力提醒订阅表。"""
+    """体力提醒订阅表：一行 = 一个推送目标。"""
 
     __tablename__ = "WavesStaminaNotice"
     __table_args__: Dict[str, Any] = {"extend_existing": True}
@@ -61,14 +50,11 @@ class WavesStaminaNotice(BaseModel, table=True):
     uid: str = Field(default="", title="鸣潮UID", index=True)
     bot_self_id: str = Field(default="", title="BotSelfID")
 
-    # —— 推送目标（可同时存在）——
-    push_private: int = Field(default=0, title="私聊推送 0/1")
-    group_ids: str = Field(default="", title="群推送群号列表(逗号分隔)")
+    # —— 推送目标：一个目标一行 ——
+    target_type: str = Field(default="", title="推送类型 private/group")
+    target_id: str = Field(default="", title="私聊留空，群聊填群号")
 
-    # —— 遗留单目标字段，只读兼容 ——
-    push_target: str = Field(default=TARGET_OFF, title="[遗留] 单目标 off/private/group")
-    group_id: str = Field(default="", title="[遗留] 单群号")
-
+    # —— 每个目标各自独立的设置与状态 ——
     threshold: int = Field(default=240, title="体力阈值")
     next_check_ts: int = Field(default=0, title="下次检查时间戳(0=立即)")
     last_energy: int = Field(default=-1, title="上次采样体力值")
@@ -80,51 +66,48 @@ class WavesStaminaNotice(BaseModel, table=True):
     created_time: Optional[int] = Field(default=None, title="创建时间")
     updated_time: Optional[int] = Field(default=None, title="更新时间")
 
-    # ---------- 目标解析 ----------
+    # ---------- 展示 ----------
 
     @property
-    def private_on(self) -> bool:
-        if self.push_private:
-            return True
-        return self.push_target == TARGET_PRIVATE
+    def is_group(self) -> bool:
+        return self.target_type == TARGET_GROUP
 
     @property
-    def groups(self) -> List[str]:
-        groups = _split_groups(self.group_ids)
-        if groups:
-            return groups
-        if self.push_target == TARGET_GROUP and self.group_id:
-            return [self.group_id]
-        return []
+    def is_valid(self) -> bool:
+        """行是否还是一个有效的推送目标。"""
+        if self.target_type == TARGET_PRIVATE:
+            return bool(self.user_id)
+        if self.target_type == TARGET_GROUP:
+            return bool(self.target_id)
+        return False
 
     @property
-    def is_enabled(self) -> bool:
-        return self.private_on or bool(self.groups)
-
-    def describe_targets(self) -> str:
-        parts = []
-        if self.private_on:
-            parts.append("私聊")
-        if self.groups:
-            parts.append("群 " + "、".join(self.groups))
-        return " / ".join(parts) if parts else "未开启"
+    def target_label(self) -> str:
+        if self.is_group:
+            return f"群 {self.target_id}"
+        return "私聊"
 
     # ---------- 查询 ----------
 
     @classmethod
     @with_session
-    async def get_record(
+    async def get_row(
         cls: Type[T_Notice],
         session: AsyncSession,
         user_id: str,
         bot_id: str,
         uid: str,
+        target_type: str,
+        target_id: str = "",
     ) -> Optional[T_Notice]:
+        """取某个人在某个目标上的那一行。"""
         sql = select(cls).where(
             and_(
-                cls.user_id == user_id,
-                cls.bot_id == bot_id,
-                cls.uid == uid,
+                col(cls.user_id) == user_id,
+                col(cls.bot_id) == bot_id,
+                col(cls.uid) == uid,
+                col(cls.target_type) == target_type,
+                func.coalesce(col(cls.target_id), "") == (target_id or ""),
             )
         )
         result = await session.execute(sql)
@@ -132,24 +115,63 @@ class WavesStaminaNotice(BaseModel, table=True):
 
     @classmethod
     @with_session
-    async def list_due(
+    async def list_rows(
         cls: Type[T_Notice],
         session: AsyncSession,
-        now: int,
-        limit: int = 300,
+        user_id: str,
+        bot_id: str,
+        uid: str,
     ) -> List[T_Notice]:
-        """取出所有「至少有一个推送目标」且已到检查时间的记录。"""
+        """取某个人的全部目标行（私聊 + 各个群）。"""
         sql = (
             select(cls)
             .where(
                 and_(
-                    or_(
-                        cls.push_private == 1,
-                        cls.group_ids != "",
-                        cls.push_target == TARGET_PRIVATE,
-                        cls.push_target == TARGET_GROUP,
-                    ),
-                    cls.next_check_ts <= now,
+                    col(cls.user_id) == user_id,
+                    col(cls.bot_id) == bot_id,
+                    col(cls.uid) == uid,
+                )
+            )
+            .order_by(col(cls.target_type), col(cls.target_id))
+        )
+        result = await session.execute(sql)
+        return list(result.scalars().all())
+
+    @classmethod
+    @with_session
+    async def list_by_uid(
+        cls: Type[T_Notice],
+        session: AsyncSession,
+        user_id: str,
+        bot_id: str,
+        uid: str,
+    ) -> List[T_Notice]:
+        """同 list_rows，供定时任务在共享一次 API 采样后批量更新。"""
+        sql = select(cls).where(
+            and_(
+                col(cls.user_id) == user_id,
+                col(cls.bot_id) == bot_id,
+                col(cls.uid) == uid,
+            )
+        )
+        result = await session.execute(sql)
+        return list(result.scalars().all())
+
+    @classmethod
+    @with_session
+    async def list_due(
+        cls: Type[T_Notice],
+        session: AsyncSession,
+        now: int,
+        limit: int = 500,
+    ) -> List[T_Notice]:
+        """取出所有已到检查时间的行。"""
+        sql = (
+            select(cls)
+            .where(
+                and_(
+                    col(cls.target_type).in_(TARGET_TYPES),
+                    col(cls.next_check_ts) <= now,
                 )
             )
             .limit(limit)
@@ -161,21 +183,28 @@ class WavesStaminaNotice(BaseModel, table=True):
 
     @classmethod
     @with_session
-    async def upsert(
+    async def upsert_row(
         cls: Type[T_Notice],
         session: AsyncSession,
         user_id: str,
         bot_id: str,
         uid: str,
+        target_type: str,
+        target_id: str = "",
         bot_self_id: str = "",
         **fields: Any,
     ) -> T_Notice:
-        """不存在则建行，存在则更新传入字段。"""
+        """在该目标上建行或更新字段（幂等）。"""
+        if target_type not in TARGET_TYPES:
+            raise ValueError(f"非法 target_type: {target_type}")
+
         sql = select(cls).where(
             and_(
-                cls.user_id == user_id,
-                cls.bot_id == bot_id,
-                cls.uid == uid,
+                col(cls.user_id) == user_id,
+                col(cls.bot_id) == bot_id,
+                col(cls.uid) == uid,
+                col(cls.target_type) == target_type,
+                func.coalesce(col(cls.target_id), "") == (target_id or ""),
             )
         )
         result = await session.execute(sql)
@@ -187,7 +216,9 @@ class WavesStaminaNotice(BaseModel, table=True):
                 user_id=user_id,
                 bot_id=bot_id,
                 uid=uid,
-                bot_self_id=bot_self_id,
+                target_type=target_type,
+                target_id=target_id or "",
+                bot_self_id=bot_self_id or "",
                 created_time=now,
                 updated_time=now,
             )
@@ -208,78 +239,74 @@ class WavesStaminaNotice(BaseModel, table=True):
     async def set_fields(
         cls: Type[T_Notice],
         session: AsyncSession,
-        user_id: str,
-        bot_id: str,
-        uid: str,
+        row_id: Optional[int],
         **fields: Any,
     ) -> None:
-        """只更新字段，不建行（定时任务用，行已被删除时静默跳过）。"""
+        """按主键更新字段（定时任务用，行已被删除时静默跳过）。"""
+        if not row_id:
+            return
         values = {k: v for k, v in fields.items() if v is not None}
         if not values:
             return
         values["updated_time"] = int(time.time())
-        sql = (
-            update(cls)
-            .where(
-                and_(
-                    col(cls.user_id) == user_id,
-                    col(cls.bot_id) == bot_id,
-                    col(cls.uid) == uid,
-                )
-            )
-            .values(**values)
-        )
+        sql = update(cls).where(col(cls.id) == row_id).values(**values)
         await session.execute(sql)
         await session.commit()
 
     @classmethod
-    async def add_group(
+    @with_session
+    async def delete_row(
         cls: Type[T_Notice],
+        session: AsyncSession,
         user_id: str,
         bot_id: str,
         uid: str,
-        group_id: str,
-        bot_self_id: str = "",
+        target_type: str,
+        target_id: str = "",
     ) -> bool:
-        """把某个群加入该用户的推送目标（幂等）。"""
-        record = await cls.get_record(user_id, bot_id, uid)
-        if record is None:
-            return False
-        await cls.set_fields(
-            user_id,
-            bot_id,
-            uid,
-            group_ids=_join_groups(record.groups + [group_id]),
-            push_private=1 if record.private_on else 0,
-            push_target=TARGET_OFF,
-            group_id="",
-            bot_self_id=bot_self_id or record.bot_self_id,
+        """删除某个目标上的那一行，返回是否真的删掉了。"""
+        sql = select(cls).where(
+            and_(
+                col(cls.user_id) == user_id,
+                col(cls.bot_id) == bot_id,
+                col(cls.uid) == uid,
+                col(cls.target_type) == target_type,
+                func.coalesce(col(cls.target_id), "") == (target_id or ""),
+            )
         )
-        return True
+        result = await session.execute(sql)
+        rows = list(result.scalars().all())
+        for row in rows:
+            await session.delete(row)
+        await session.commit()
+        return bool(rows)
 
     @classmethod
-    async def remove_group(
+    @with_session
+    async def delete_all(
         cls: Type[T_Notice],
+        session: AsyncSession,
         user_id: str,
         bot_id: str,
         uid: str,
-        group_id: str,
-    ) -> bool:
-        """把某个群从推送目标里移除（幂等）。"""
-        record = await cls.get_record(user_id, bot_id, uid)
-        if record is None:
-            return False
-        groups = [g for g in record.groups if g != group_id]
-        await cls.set_fields(
-            user_id,
-            bot_id,
-            uid,
-            group_ids=_join_groups(groups),
-            push_private=1 if record.private_on else 0,
-            push_target=TARGET_OFF,
-            group_id="",
+    ) -> int:
+        """删除某人某个 UID 下的全部目标行。"""
+        sql = select(cls).where(
+            and_(
+                col(cls.user_id) == user_id,
+                col(cls.bot_id) == bot_id,
+                col(cls.uid) == uid,
+            )
         )
-        return True
+        result = await session.execute(sql)
+        rows = list(result.scalars().all())
+        for row in rows:
+            await session.delete(row)
+        await session.commit()
+        return len(rows)
+
+
+# ---------------------------- 建表 / 迁移 ----------------------------
 
 
 def _default_clause(column) -> Optional[str]:
@@ -303,17 +330,17 @@ def _default_clause(column) -> Optional[str]:
     return None
 
 
+def _table_columns(sync_conn, name: str) -> Optional[List[str]]:
+    insp = sa_inspect(sync_conn)
+    if not insp.has_table(name):
+        return None
+    return [c["name"] for c in insp.get_columns(name)]
+
+
 async def _add_missing_columns(table) -> None:
-    """老表补列（热重载 / 升级场景），幂等。"""
-
-    def _existing(sync_conn, name):
-        insp = sa_inspect(sync_conn)
-        if not insp.has_table(name):
-            return None
-        return {c["name"] for c in insp.get_columns(name)}
-
+    """老表补列（升级场景），幂等。"""
     async with engine.connect() as conn:
-        existing = await conn.run_sync(_existing, table.name)
+        existing = await conn.run_sync(_table_columns, table.name)
         dialect = conn.dialect
     if existing is None:
         return
@@ -338,31 +365,115 @@ async def _add_missing_columns(table) -> None:
             logger.warning(f"[体力提醒] 补列失败 {sql} -> {e}")
 
 
-async def _backfill_targets() -> None:
-    """把 v1 的单目标数据迁移到新字段（幂等）。"""
+_LEGACY_COLUMNS = ("push_private", "group_ids", "push_target", "group_id")
+_CARRY_COLUMNS = (
+    "bot_self_id",
+    "threshold",
+    "next_check_ts",
+    "last_energy",
+    "crazy",
+    "last_push_ts",
+    "push_count",
+)
+
+
+async def _migrate_legacy() -> None:
+    """把「一个用户一行 + 目标列表」的旧数据拆成「一个目标一行」（幂等）。"""
     table = WavesStaminaNotice.__tablename__
-    statements = (
-        f"UPDATE {table} SET push_private = 1 "
-        f"WHERE push_target = '{TARGET_PRIVATE}' AND push_private = 0",
-        f"UPDATE {table} SET group_ids = group_id "
-        f"WHERE push_target = '{TARGET_GROUP}' AND (group_ids IS NULL OR group_ids = '') "
-        f"AND group_id IS NOT NULL AND group_id != ''",
+    async with engine.connect() as conn:
+        existing = await conn.run_sync(_table_columns, table)
+    if not existing:
+        return
+    legacy = [c for c in _LEGACY_COLUMNS if c in existing]
+    if not legacy or "target_type" not in existing:
+        return
+
+    select_cols = ["id", "user_id", "bot_id", "uid"] + [
+        c for c in _CARRY_COLUMNS if c in existing
+    ] + legacy
+    quoted = ", ".join(f'"{c}"' for c in select_cols)
+    sql = (
+        f'SELECT {quoted} FROM "{table}" '
+        f"WHERE COALESCE(target_type, '') NOT IN ('private', 'group')"
     )
-    for sql in statements:
+    async with engine.connect() as conn:
+        result = await conn.execute(text(sql))
+        rows = [dict(r._mapping) for r in result.fetchall()]
+    if not rows:
+        return
+
+    logger.info(f"[体力提醒] 发现 {len(rows)} 行旧数据，开始拆分推送目标")
+
+    for row in rows:
+        user_id = row.get("user_id") or ""
+        bot_id = row.get("bot_id") or ""
+        uid = row.get("uid") or ""
+        carry = {c: row.get(c) for c in _CARRY_COLUMNS if c in row}
+
+        targets: List[tuple] = []
+        private_flag = row.get("push_private") or 0
+        legacy_target = row.get("push_target") or ""
+        if private_flag or legacy_target == "private":
+            targets.append((TARGET_PRIVATE, ""))
+        raw_groups = row.get("group_ids") or ""
+        if not raw_groups and legacy_target == "group":
+            raw_groups = row.get("group_id") or ""
+        for group_id in [g.strip() for g in str(raw_groups).split(",")]:
+            if group_id:
+                targets.append((TARGET_GROUP, group_id))
+
+        for target_type, target_id in targets:
+            try:
+                await WavesStaminaNotice.upsert_row(
+                    user_id,
+                    bot_id,
+                    uid,
+                    target_type,
+                    target_id,
+                    **carry,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[体力提醒] 迁移 {uid} -> {target_type}:{target_id} 失败: {e}"
+                )
+
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f'DELETE FROM "{table}" WHERE id = :rid'), {"rid": row["id"]}
+                )
+        except Exception as e:
+            logger.warning(f"[体力提醒] 删除旧行 {row['id']} 失败: {e}")
+
+
+async def _dedupe_and_index() -> None:
+    """去重后建唯一索引，保证同一目标只有一行。"""
+    table = WavesStaminaNotice.__tablename__
+    keys = 'user_id, bot_id, uid, target_type, COALESCE(target_id, \'\')'
+    dedupe_sql = (
+        f'DELETE FROM "{table}" WHERE id NOT IN ('
+        f"SELECT mid FROM (SELECT MIN(id) AS mid FROM \"{table}\" GROUP BY {keys}) AS x)"
+    )
+    index_sql = (
+        f'CREATE UNIQUE INDEX IF NOT EXISTS "ix_{table}_target" '
+        f'ON "{table}" (user_id, bot_id, uid, target_type, target_id)'
+    )
+    for sql in (dedupe_sql, index_sql):
         try:
             async with engine.begin() as conn:
                 await conn.execute(text(sql))
         except Exception as e:
-            logger.debug(f"[体力提醒] 迁移旧目标跳过: {e}")
+            logger.debug(f"[体力提醒] 索引步骤跳过: {e}")
 
 
 async def ensure_tables() -> None:
-    """建表 + 补列 + 旧数据迁移（全部幂等）。"""
+    """建表 + 补列 + 旧数据拆分 + 唯一索引（全部幂等）。"""
     table = WavesStaminaNotice.__table__  # type: ignore[attr-defined]
     async with engine.begin() as conn:
         await conn.run_sync(lambda c: SQLModel.metadata.create_all(c, tables=[table]))
     await _add_missing_columns(table)
-    await _backfill_targets()
+    await _migrate_legacy()
+    await _dedupe_and_index()
 
 
 # 后台管理页（可选，失败不影响功能）

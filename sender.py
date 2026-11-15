@@ -1,8 +1,8 @@
-"""推送发送器（支持一次投递多个目标）。
+"""推送发送器（一行只发一个目标）。
 
-同一个人可以同时订阅「私聊」和「若干个群」，所以这里按目标列表逐个发送：
-- 私聊：纯文本
-- 群聊：文本 + @订阅者本人（不是 @全体）
+数据层是「一个目标一行」，所以这里不再展开目标列表：
+* ``target_type == 'private'`` → 发到 ``user_id``，纯文本
+* ``target_type == 'group'``   → 发到 ``target_id``（群号），文本 + @订阅者本人
 
 只推给「订阅时记录下来的那一个 bot」，不像某些实现那样遍历 ``gss.active_bot``
 全量广播——多 bot 场景下那样会重复发 N 份。
@@ -16,7 +16,7 @@ from gsuid_core.gss import gss
 from gsuid_core.logger import logger
 from gsuid_core.segment import MessageSegment
 
-from .models import WavesStaminaNotice
+from .models import TARGET_GROUP, WavesStaminaNotice
 
 
 def _pick_bot(bot_id: str):
@@ -29,48 +29,47 @@ def _pick_bot(bot_id: str):
         return None
 
 
-def _targets(record: WavesStaminaNotice) -> List[Tuple[str, str]]:
-    """展开推送目标：[(direct|group, 目标ID), ...]"""
-    targets: List[Tuple[str, str]] = []
-    if record.private_on and record.user_id:
-        targets.append(("direct", record.user_id))
-    for group_id in record.groups:
-        if group_id:
-            targets.append(("group", group_id))
-    return targets
+def _target(record: WavesStaminaNotice) -> Tuple[str, str]:
+    """这一行要发到哪：(direct|group, 目标ID)。"""
+    if record.target_type == TARGET_GROUP and record.target_id:
+        return "group", record.target_id
+    return "direct", record.user_id
 
 
-async def send_push(record: WavesStaminaNotice, text: str) -> int:
-    """按记录里的所有目标投递，返回成功条数。"""
-    targets = _targets(record)
-    if not targets:
-        return 0
+async def send_push(record: WavesStaminaNotice, text: str) -> bool:
+    """把提醒发到这一行对应的目标，成功返回 True。"""
+    target_type, target_id = _target(record)
+    if not target_id:
+        logger.warning(f"[体力提醒] 目标为空，跳过 uid={record.uid} id={record.id}")
+        return False
 
     bot = _pick_bot(record.bot_id)
     if bot is None:
         logger.warning(f"[体力提醒] 没有可用的 bot，跳过推送 uid={record.uid}")
-        return 0
+        return False
 
-    ok = 0
-    for target_type, target_id in targets:
-        if target_type == "group":
-            messages = [MessageSegment.text(text), MessageSegment.at(record.user_id)]
-        else:
-            messages = [MessageSegment.text(text)]
-        try:
-            await bot.target_send(
-                messages,
-                target_type,
-                target_id,
-                record.bot_id,
-                record.bot_self_id,
-                "",
-            )
-            ok += 1
-        except Exception as e:
-            logger.exception(
-                f"[体力提醒] 推送失败 uid={record.uid} "
-                f"target={target_type}:{target_id} -> {e}"
-            )
+    if target_type == "group":
+        messages: List = [
+            MessageSegment.text(text),
+            MessageSegment.at(record.user_id),
+        ]
+    else:
+        messages = [MessageSegment.text(text)]
+
+    try:
+        await bot.target_send(
+            messages,
+            target_type,
+            target_id,
+            record.bot_id,
+            record.bot_self_id,
+            "",
+        )
         await asyncio.sleep(0.5 + random.random())
-    return ok
+        return True
+    except Exception as e:
+        logger.exception(
+            f"[体力提醒] 推送失败 uid={record.uid} "
+            f"target={target_type}:{target_id} -> {e}"
+        )
+        return False
