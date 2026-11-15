@@ -18,7 +18,7 @@ from gsuid_core.aps import scheduler
 from gsuid_core.logger import logger
 
 from . import stamina_config as cfg
-from .models import TARGET_OFF, WavesStaminaNotice
+from .models import WavesStaminaNotice
 from .sender import send_push
 from .xw_bridge import fetch_energy, xw_prefix
 
@@ -72,6 +72,7 @@ async def _check_one(record: WavesStaminaNotice, now: int) -> None:
             record.bot_id,
             record.uid,
             next_check_ts=now + FAIL_BACKOFF,
+            fail_count=(record.fail_count or 0) + 1,
             last_error=err[:200],
         )
         logger.info(f"[体力提醒] uid={record.uid} 采样失败，10 分钟后重试：{err}")
@@ -79,7 +80,7 @@ async def _check_one(record: WavesStaminaNotice, now: int) -> None:
 
     threshold = record.threshold or CAP_DEFAULT
     crazy = record.crazy == "on" and cfg.crazy_enabled()
-    updates = {"last_energy": cur, "last_error": ""}
+    updates = {"last_energy": cur, "last_error": "", "fail_count": 0}
 
     if cur >= threshold:
         if crazy:
@@ -105,7 +106,8 @@ async def _check_one(record: WavesStaminaNotice, now: int) -> None:
     )
     if updates.get("last_push_ts") == now:
         logger.info(
-            f"[体力提醒] 已推送给 uid={record.uid} target={record.push_target} 体力={cur}"
+            f"[体力提醒] 已推送给 uid={record.uid} "
+            f"targets={record.describe_targets()} 体力={cur}"
         )
 
 
@@ -129,7 +131,7 @@ async def tick() -> None:
 
         logger.debug(f"[体力提醒] 本轮待检查 {len(records)} 条")
         for record in records:
-            if record.push_target == TARGET_OFF:
+            if not record.is_enabled:
                 continue
             try:
                 await _check_one(record, now)
