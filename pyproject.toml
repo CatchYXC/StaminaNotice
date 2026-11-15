@@ -1,0 +1,11 @@
+[project]
+name = "StaminaNotice"
+version = "1.0.0"
+description = "鸣潮体力提醒推送（独立插件，与 XutheringWavesUID 同时安装）"
+authors = [{ name = "StaminaNotice" }]
+requires-python = ">=3.10"
+dependencies = ["gsuid-core"]
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
