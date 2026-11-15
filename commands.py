@@ -3,7 +3,7 @@
 指令词（前缀统一为 ww，与 XutheringWavesUID 一致）：
     ww开启体力提醒 / ww关闭体力提醒
     ww开启催命模式 / ww关闭催命模式
-    ww体力提醒阈值240 / ww体力提醒阈值
+    ww设置提醒阈值240 / ww设置提醒阈值（查状态）
     ww体力提醒状态
 """
 
@@ -26,7 +26,9 @@ from .push_engine import compute_next_check
 
 sv_notice = SV("ww体力提醒")
 sv_crazy = SV("ww催命模式")
-sv_threshold = SV("ww体力提醒阈值")
+# priority=1：XutheringWavesUID 的「waves配置」用 on_prefix("设置", block=True)
+# 且 priority=3，会把「设置XXX」整段吞掉。这里必须抢在它前面并 block。
+sv_threshold = SV("ww设置提醒阈值", priority=1)
 
 XW_MISSING = (
     "❌ 未检测到可用的 XutheringWavesUID\n"
@@ -105,7 +107,7 @@ async def open_notice(bot: Bot, ev: Event):
     if cur >= threshold:
         lines.append("⚠️ 当前体力已达阈值，本次不重复推送；清完体力后会自动开始计时\n")
     lines.append(
-        f"🔧 修改阈值：[{xw_bridge.xw_prefix()}体力提醒阈值240]\n"
+        f"🔧 修改阈值：[{xw_bridge.xw_prefix()}设置提醒阈值240]\n"
         f"🔧 关闭提醒：[{xw_bridge.xw_prefix()}关闭体力提醒]"
     )
     logger.info(f"[体力提醒] 开启 uid={uid} user={user_id} target={target}")
@@ -189,7 +191,7 @@ async def close_crazy(bot: Bot, ev: Event):
     return await bot.send("❌ 已关闭催命模式，体力提醒仍然保留")
 
 
-@sv_threshold.on_regex(r"^体力提醒阈值\s*(?P<num>\d{1,3})$", block=True)
+@sv_threshold.on_regex(r"^(?:设置)?提醒阈值\s*(?P<num>\d{1,3})$", block=True)
 async def set_threshold(bot: Bot, ev: Event):
     user_id, uid, err = await _prepare(ev)
     if err:
@@ -231,7 +233,10 @@ async def set_threshold(bot: Bot, ev: Event):
     return await bot.send(f"✅ 体力提醒阈值已设置为 {value}（当前体力 {cur}）")
 
 
-@sv_threshold.on_fullmatch(("体力提醒阈值", "查看体力提醒", "体力提醒状态"), block=True)
+@sv_threshold.on_fullmatch(
+    ("设置提醒阈值", "提醒阈值", "查看提醒阈值", "查看体力提醒", "体力提醒状态"),
+    block=True,
+)
 async def show_status(bot: Bot, ev: Event):
     user_id, uid, err = await _prepare(ev)
     if err:
