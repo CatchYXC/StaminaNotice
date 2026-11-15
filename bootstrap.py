@@ -26,6 +26,7 @@ async def _stamina_notice_startup() -> None:
             "[体力提醒] 已接入 XutheringWavesUID"
             f"（检查间隔 {cfg.check_minutes()} 分钟，催命间隔 {cfg.crazy_minutes()} 分钟）"
         )
+        logger.info(f"[体力提醒] 依赖模块：{xw_bridge.describe()}")
     else:
         logger.warning(
             "[体力提醒] 未检测到 XutheringWavesUID，指令会提示用户安装；"

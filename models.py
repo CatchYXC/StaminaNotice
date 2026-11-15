@@ -9,7 +9,7 @@ upsert 抢行、语义也会串（它的 stamina_push_switch 既表示开关又�
 import time
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
-from sqlmodel import Field, SQLModel, select
+from sqlmodel import Field, SQLModel, col, select
 from sqlalchemy import update
 from sqlalchemy.sql import and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -156,9 +156,9 @@ class WavesStaminaNotice(BaseModel, table=True):
             update(cls)
             .where(
                 and_(
-                    cls.user_id == user_id,
-                    cls.bot_id == bot_id,
-                    cls.uid == uid,
+                    col(cls.user_id) == user_id,
+                    col(cls.bot_id) == bot_id,
+                    col(cls.uid) == uid,
                 )
             )
             .values(**values)

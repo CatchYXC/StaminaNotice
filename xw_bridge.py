@@ -5,43 +5,86 @@
    ``init_localization()``、``asyncio.get_event_loop().create_task(...)``，
    所以绝不能在模块顶层 import 它，只能在 async 上下文里懒加载。
 2. gsuid_core 的加载器可能把对方以不同 namespace 载入（nest 结构 / 热重载），
-   因此优先从 ``sys.modules`` 里按后缀嗅探已经加载好的模块，避免让它的
-   ``__init__.py`` 被二次执行（重复注册 hook / 重复建定时任务）。
-3. 对方任何一个符号取不到，本插件降级为「提示用户先安装/升级
+   因此优先从 ``sys.modules`` 里找已经加载好的模块，避免让它的 ``__init__.py``
+   被二次执行（重复注册 hook / 重复建定时任务）。
+3. 找模块时**必须**校验包名 + 校验符号。曾经只用 ``endswith("utils.database.models")``
+   嗅探，结果命中了 gsuid_core 自己的 ``gsuid_core.utils.database.models``
+   （它没有 WavesBind），导致「已绑定却提示未绑定」。
+4. 对方任何一个符号取不到，本插件降级为「提示用户先安装/升级
    XutheringWavesUID」，而不是抛异常拖垮整个核心。
 """
 
 import sys
 import importlib
-from typing import Any, Optional, Tuple
+from typing import Any, Iterator, Optional, Tuple
 
 from gsuid_core.logger import logger
 
 XW_ROOT = "XutheringWavesUID"
 
+# suffix -> 该模块必须导出的符号；用来把「同名但不同包」的模块排除掉
+_REQUIRED: dict = {
+    "utils.database.models": ("WavesBind", "WavesUser"),
+    "utils.waves_api": ("waves_api",),
+    "utils.api.model": ("DailyData",),
+    "utils.api.launcher_chain": ("fetch_launcher_panel",),
+    "utils.at_help": ("ruser_id",),
+}
+
 _CACHE: dict = {}
 _ERROR: str = ""
 
 
-def _sniff(suffix: str) -> Optional[Any]:
-    """在 sys.modules 里按 ``*.suffix`` 找已经加载好的模块。"""
-    for name, module in list(sys.modules.items()):
-        if module is None:
+def _iter_loaded(suffix: str) -> Iterator[Any]:
+    """枚举 sys.modules 里「可能属于对方」的候选模块。
+
+    只认两种名字，避免误伤其它插件 / 核心的同名子模块：
+    - ``XutheringWavesUID.utils.xxx``
+    - ``...XutheringWavesUID.utils.xxx``（nest 结构、带父命名空间装载）
+    """
+    exact = f"{XW_ROOT}.{suffix}"
+    module = sys.modules.get(exact)
+    if module is not None:
+        yield module
+
+    tail = f".{XW_ROOT}.{suffix}"
+    for name, loaded in list(sys.modules.items()):
+        if loaded is None or name == exact:
             continue
-        if name == suffix or name.endswith("." + suffix):
+        if name.endswith(tail):
+            yield loaded
+
+
+def _resolve(suffix: str) -> Any:
+    required = _REQUIRED.get(suffix, ())
+    rejected = []
+
+    for module in _iter_loaded(suffix):
+        missing = [attr for attr in required if not hasattr(module, attr)]
+        if not missing:
             return module
-    return None
+        rejected.append(f"{module.__name__}(缺 {','.join(missing)})")
+
+    # sys.modules 里没有可用的 → 主动 import 对方顶层包
+    try:
+        module = importlib.import_module(f"{XW_ROOT}.{suffix}")
+    except Exception as e:
+        extra = f"；已跳过候选 {rejected}" if rejected else ""
+        raise ImportError(f"无法导入 {XW_ROOT}.{suffix}: {e}{extra}") from e
+
+    missing = [attr for attr in required if not hasattr(module, attr)]
+    if missing:
+        raise ImportError(f"{module.__name__} 缺少符号 {missing}")
+    return module
 
 
 def _get(suffix: str) -> Any:
     """取对方模块，suffix 形如 ``utils.database.models``。"""
     if suffix in _CACHE:
         return _CACHE[suffix]
-
-    module = _sniff(suffix)
-    if module is None:
-        module = importlib.import_module(f"{XW_ROOT}.{suffix}")
+    module = _resolve(suffix)
     _CACHE[suffix] = module
+    logger.debug(f"[体力提醒] 已接入 {module.__name__}")
     return module
 
 
@@ -62,24 +105,33 @@ def _launcher_chain() -> Any:
 
 
 def ensure() -> bool:
-    """预热并自检依赖，返回是否可用。"""
+    """预热并自检依赖，返回是否可用。失败时清空缓存，避免坏结果被复用。"""
     global _ERROR
     try:
         _models()
         _api()
         _daily_data()
+        _launcher_chain()
         _ERROR = ""
         return True
     except Exception as e:
+        _CACHE.clear()
         _ERROR = f"{type(e).__name__}: {e}"
         logger.warning(f"[体力提醒] 依赖 XutheringWavesUID 不可用: {_ERROR}")
         return False
 
 
 def available() -> bool:
-    if _CACHE:
-        return not _ERROR
+    if _CACHE and not _ERROR:
+        return True
     return ensure()
+
+
+def describe() -> str:
+    """已解析到的模块清单，写进启动日志便于排障。"""
+    if not _CACHE:
+        return "（未解析）"
+    return ", ".join(sorted(m.__name__ for m in _CACHE.values()))
 
 
 def error() -> str:
@@ -91,7 +143,7 @@ async def get_uid(user_id: str, bot_id: str) -> Optional[str]:
     try:
         return await _models().WavesBind.get_uid_by_game(user_id, bot_id)
     except Exception as e:
-        logger.warning(f"[体力提醒] 读取绑定 UID 失败: {e}")
+        logger.warning(f"[体力提醒] 读取绑定 UID 失败: {type(e).__name__}: {e}")
         return None
 
 
