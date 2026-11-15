@@ -40,12 +40,12 @@ async def send_push(record: WavesStaminaNotice, text: str) -> bool:
     """把提醒发到这一行对应的目标，成功返回 True。"""
     target_type, target_id = _target(record)
     if not target_id:
-        logger.warning(f"[体力提醒] 目标为空，跳过 uid={record.uid} id={record.id}")
+        logger.warning(f"[鸣潮体力提醒] 目标为空，跳过 uid={record.uid} id={record.id}")
         return False
 
     bot = _pick_bot(record.bot_id)
     if bot is None:
-        logger.warning(f"[体力提醒] 没有可用的 bot，跳过推送 uid={record.uid}")
+        logger.warning(f"[鸣潮体力提醒] 没有可用的 bot，跳过推送 uid={record.uid}")
         return False
 
     if target_type == "group":
@@ -69,7 +69,7 @@ async def send_push(record: WavesStaminaNotice, text: str) -> bool:
         return True
     except Exception as e:
         logger.exception(
-            f"[体力提醒] 推送失败 uid={record.uid} "
+            f"[鸣潮体力提醒] 推送失败 uid={record.uid} "
             f"target={target_type}:{target_id} -> {e}"
         )
         return False

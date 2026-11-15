@@ -84,7 +84,7 @@ def _get(suffix: str) -> Any:
         return _CACHE[suffix]
     module = _resolve(suffix)
     _CACHE[suffix] = module
-    logger.debug(f"[体力提醒] 已接入 {module.__name__}")
+    logger.debug(f"[鸣潮体力提醒] 已接入 {module.__name__}")
     return module
 
 
@@ -117,7 +117,7 @@ def ensure() -> bool:
     except Exception as e:
         _CACHE.clear()
         _ERROR = f"{type(e).__name__}: {e}"
-        logger.warning(f"[体力提醒] 依赖 XutheringWavesUID 不可用: {_ERROR}")
+        logger.warning(f"[鸣潮体力提醒] 依赖 XutheringWavesUID 不可用: {_ERROR}")
         return False
 
 
@@ -143,7 +143,7 @@ async def get_uid(user_id: str, bot_id: str) -> Optional[str]:
     try:
         return await _models().WavesBind.get_uid_by_game(user_id, bot_id)
     except Exception as e:
-        logger.warning(f"[体力提醒] 读取绑定 UID 失败: {type(e).__name__}: {e}")
+        logger.warning(f"[鸣潮体力提醒] 读取绑定 UID 失败: {type(e).__name__}: {e}")
         return None
 
 
@@ -219,5 +219,5 @@ async def fetch_energy(
             "",
         )
     except Exception as e:
-        logger.exception("[体力提醒] 取体力数据异常")
+        logger.exception("[鸣潮体力提醒] 取体力数据异常")
         return None, None, f"获取体力数据异常：{type(e).__name__}"

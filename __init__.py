@@ -22,4 +22,4 @@ from . import push_engine  # noqa: E402,F401
 from . import commands  # noqa: E402,F401
 from . import bootstrap  # noqa: E402,F401
 
-logger.debug("[体力提醒] StaminaNotice 插件已加载")
+logger.debug("[鸣潮体力提醒] StaminaNotice 插件已加载")

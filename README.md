@@ -28,8 +28,8 @@ gsuid_core/plugins/XutheringWavesUID.../
 启动日志出现以下两行即正常：
 
 ```
-[体力提醒] 数据表 WavesStaminaNotice 就绪
-[体力提醒] 已接入 XutheringWavesUID（检查间隔 6 分钟，催命间隔 60 分钟）
+[鸣潮体力提醒] 数据表 WavesStaminaNotice 就绪
+[鸣潮体力提醒] 已接入 XutheringWavesUID（检查间隔 6 分钟，催命间隔 60 分钟）
 ```
 
 ## 指令
@@ -109,6 +109,6 @@ gsuid_core/plugins/XutheringWavesUID.../
 ## 排障
 
 - `❌ 未检测到可用的 XutheringWavesUID`：对方未安装/未启用，或 import 失败（看核心日志里的
-  `[体力提醒] 依赖 XutheringWavesUID 不可用` 那一行的具体异常）。
+  `[鸣潮体力提醒] 依赖 XutheringWavesUID 不可用` 那一行的具体异常）。
 - `❌ 未绑定 cookie`：先在对方插件里用 `ww每日` 或 `ww登录` 完成一次登录。
 - 状态里 `上次取数错误` 有内容：说明该 UID 的 cookie 已失效，重登即可。

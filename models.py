@@ -2,20 +2,8 @@
 
 数据模型
 --------
-不再用「一个用户一行 + 目标列表」的写法，改成**一个目标一行**：
-
-* 一行 ``target_type='private', target_id=''`` —— 私聊推送
-* 一行 ``target_type='group',   target_id='群号'`` —— 某个群的推送
-
-这样每个人在同一个群里开的提醒、在私聊开的提醒，各自有自己的阈值、
-催命状态、下次检查时间、推送计数，互不影响；群里的设置只改群里的那行，
-私聊的设置只改私聊那行，查询和排障也都只面对一条扁平记录。
-
 唯一键：``(user_id, bot_id, uid, target_type, target_id)``
 
-刻意不复用 XutheringWavesUID 的 WavesStaminaRecord：那张表由它的「每日」
-和后台 Admin 写入，外部插件插写会与它的 upsert 抢行、语义也会串
-（它的 stamina_push_switch 既表示开关又表示群号）。
 """
 
 import time
@@ -51,15 +39,15 @@ class WavesStaminaNotice(BaseModel, table=True):
     bot_self_id: str = Field(default="", title="BotSelfID")
 
     # —— 推送目标：一个目标一行 ——
-    target_type: str = Field(default="", title="推送类型 private/group")
-    target_id: str = Field(default="", title="私聊留空，群聊填群号")
+    target_type: str = Field(default="", title="推送类型")
+    target_id: str = Field(default="", title="群号")
 
     # —— 每个目标各自独立的设置与状态 ——
     threshold: int = Field(default=240, title="体力阈值")
-    next_check_ts: int = Field(default=0, title="下次检查时间戳(0=立即)")
-    last_energy: int = Field(default=-1, title="上次采样体力值")
-    crazy: str = Field(default="off", title="催命模式 on/off")
-    last_push_ts: int = Field(default=0, title="上次推送时间戳")
+    next_check_ts: int = Field(default=0, title="下次检查时间")
+    last_energy: int = Field(default=-1, title="结晶波片值")
+    crazy: str = Field(default="off", title="催命模式")
+    last_push_ts: int = Field(default=0, title="上次推送时间")
     push_count: int = Field(default=0, title="累计推送次数")
     fail_count: int = Field(default=0, title="连续取数失败次数")
     last_error: str = Field(default="", title="上次取数错误")
@@ -122,7 +110,7 @@ class WavesStaminaNotice(BaseModel, table=True):
         bot_id: str,
         uid: str,
     ) -> List[T_Notice]:
-        """取某个人的全部目标行（私聊 + 各个群）。"""
+        """取某个人的全部目标行。"""
         sql = (
             select(cls)
             .where(
@@ -194,7 +182,7 @@ class WavesStaminaNotice(BaseModel, table=True):
         bot_self_id: str = "",
         **fields: Any,
     ) -> T_Notice:
-        """在该目标上建行或更新字段（幂等）。"""
+        """在该目标上建行或更新字段。"""
         if target_type not in TARGET_TYPES:
             raise ValueError(f"非法 target_type: {target_type}")
 
@@ -242,7 +230,7 @@ class WavesStaminaNotice(BaseModel, table=True):
         row_id: Optional[int],
         **fields: Any,
     ) -> None:
-        """按主键更新字段（定时任务用，行已被删除时静默跳过）。"""
+        """按主键更新字段。"""
         if not row_id:
             return
         values = {k: v for k, v in fields.items() if v is not None}
@@ -338,7 +326,7 @@ def _table_columns(sync_conn, name: str) -> Optional[List[str]]:
 
 
 async def _add_missing_columns(table) -> None:
-    """老表补列（升级场景），幂等。"""
+    """老表补列，幂等。"""
     async with engine.connect() as conn:
         existing = await conn.run_sync(_table_columns, table.name)
         dialect = conn.dialect
@@ -360,9 +348,9 @@ async def _add_missing_columns(table) -> None:
         try:
             async with engine.begin() as conn:
                 await conn.execute(text(sql))
-            logger.info(f"[体力提醒] 补列 {sql}")
+            logger.info(f"[鸣潮体力提醒] 补列 {sql}")
         except Exception as e:
-            logger.warning(f"[体力提醒] 补列失败 {sql} -> {e}")
+            logger.warning(f"[鸣潮体力提醒] 补列失败 {sql} -> {e}")
 
 
 _LEGACY_COLUMNS = ("push_private", "group_ids", "push_target", "group_id")
@@ -402,7 +390,7 @@ async def _migrate_legacy() -> None:
     if not rows:
         return
 
-    logger.info(f"[体力提醒] 发现 {len(rows)} 行旧数据，开始拆分推送目标")
+    logger.info(f"[鸣潮体力提醒] 发现 {len(rows)} 行旧数据，开始拆分推送目标")
 
     for row in rows:
         user_id = row.get("user_id") or ""
@@ -434,7 +422,7 @@ async def _migrate_legacy() -> None:
                 )
             except Exception as e:
                 logger.warning(
-                    f"[体力提醒] 迁移 {uid} -> {target_type}:{target_id} 失败: {e}"
+                    f"[鸣潮体力提醒] 迁移 {uid} -> {target_type}:{target_id} 失败: {e}"
                 )
 
         try:
@@ -443,7 +431,7 @@ async def _migrate_legacy() -> None:
                     text(f'DELETE FROM "{table}" WHERE id = :rid'), {"rid": row["id"]}
                 )
         except Exception as e:
-            logger.warning(f"[体力提醒] 删除旧行 {row['id']} 失败: {e}")
+            logger.warning(f"[鸣潮体力提醒] 删除旧行 {row['id']} 失败: {e}")
 
 
 async def _dedupe_and_index() -> None:
@@ -463,7 +451,31 @@ async def _dedupe_and_index() -> None:
             async with engine.begin() as conn:
                 await conn.execute(text(sql))
         except Exception as e:
-            logger.debug(f"[体力提醒] 索引步骤跳过: {e}")
+            logger.debug(f"[鸣潮体力提醒] 索引步骤跳过: {e}")
+
+
+async def _log_stats() -> None:
+    """启动时打一行统计，方便确认数据到底存在哪、有几条。"""
+    table = WavesStaminaNotice.__tablename__
+    sql = (
+        f'SELECT target_type, COUNT(1) FROM "{table}" '
+        f"GROUP BY target_type"
+    )
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text(sql))
+            stats = {str(row[0] or "未知"): row[1] for row in result.fetchall()}
+    except Exception as e:
+        logger.debug(f"[鸣潮体力提醒] 统计行数失败: {e}")
+        return
+    if not stats:
+        logger.info(f"[鸣潮体力提醒] 表 {table} 当前没有任何订阅")
+        return
+    detail = "、".join(
+        f"{'私聊' if k == TARGET_PRIVATE else ('群' if k == TARGET_GROUP else k)} {v} 条"
+        for k, v in sorted(stats.items())
+    )
+    logger.info(f"[鸣潮体力提醒] 表 {table} 现有订阅：{detail}")
 
 
 async def ensure_tables() -> None:
@@ -474,6 +486,7 @@ async def ensure_tables() -> None:
     await _add_missing_columns(table)
     await _migrate_legacy()
     await _dedupe_and_index()
+    await _log_stats()
 
 
 # 后台管理页（可选，失败不影响功能）
@@ -495,4 +508,4 @@ try:
         model = WavesStaminaNotice
 
 except Exception:  # pragma: no cover - 老版本 gsuid_core 没有 webconsole
-    logger.debug("[体力提醒] 未注册后台管理页")
+    logger.debug("[鸣潮体力提醒] 未注册后台管理页")

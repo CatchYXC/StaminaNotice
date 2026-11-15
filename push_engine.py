@@ -62,7 +62,6 @@ def _build_text(record: WavesStaminaNotice, cur: int, threshold: int, crazy: boo
         lines.append(f"⏰催命模式开启中，{cfg.crazy_minutes()} 分钟后仍未清理会再次提醒\n")
     else:
         lines.append("📅清完体力后会自动重新计时\n")
-    lines.append(f"🔧发送 [{prefix}关闭体力提醒] 可随时关闭")
     return "".join(lines)
 
 
@@ -120,7 +119,7 @@ async def _check_bucket(
                 last_error=(err or "")[:200],
             )
         logger.info(
-            f"[体力提醒] uid={uid} 采样失败（{len(due_rows)} 行待检查），"
+            f"[鸣潮体力提醒] uid={uid} 采样失败（{len(due_rows)} 行待检查），"
             f"10 分钟后重试：{err}"
         )
         return
@@ -130,7 +129,7 @@ async def _check_bucket(
         try:
             updates = await _decide_row(row, cur, refresh_ts or 0, now)
         except Exception as e:
-            logger.exception(f"[体力提醒] 判定失败 uid={uid} row={row.id}: {e}")
+            logger.exception(f"[鸣潮体力提醒] 判定失败 uid={uid} row={row.id}: {e}")
             continue
         await WavesStaminaNotice.set_fields(row.id, **updates)
         if updates.get("last_push_ts") == now:
@@ -138,7 +137,7 @@ async def _check_bucket(
 
     if pushed:
         logger.info(
-            f"[体力提醒] 已推送 uid={uid} 体力={cur} 目标={'、'.join(pushed)}"
+            f"[鸣潮体力提醒] 已推送 uid={uid} 体力={cur} 目标={'、'.join(pushed)}"
         )
 
 
@@ -147,7 +146,7 @@ async def tick() -> None:
     if not cfg.push_enabled():
         return
     if _tick_lock.locked():
-        logger.debug("[体力提醒] 上一轮还没跑完，跳过本轮")
+        logger.debug("[鸣潮体力提醒] 上一轮还没跑完，跳过本轮")
         return
 
     async with _tick_lock:
@@ -155,7 +154,7 @@ async def tick() -> None:
         try:
             rows = await WavesStaminaNotice.list_due(now)
         except Exception as e:
-            logger.exception(f"[体力提醒] 查询待检查记录失败: {e}")
+            logger.exception(f"[鸣潮体力提醒] 查询待检查记录失败: {e}")
             return
         if not rows:
             return
@@ -171,14 +170,14 @@ async def tick() -> None:
         if not buckets:
             return
         logger.debug(
-            f"[体力提醒] 本轮 {len(rows)} 行待检查，涉及 {len(buckets)} 个账号"
+            f"[鸣潮体力提醒] 本轮 {len(rows)} 行待检查，涉及 {len(buckets)} 个账号"
         )
 
         for (user_id, bot_id, uid), due_rows in buckets.items():
             try:
                 await _check_bucket(user_id, bot_id, uid, due_rows, now)
             except Exception as e:
-                logger.exception(f"[体力提醒] 处理 uid={uid} 异常: {e}")
+                logger.exception(f"[鸣潮体力提醒] 处理 uid={uid} 异常: {e}")
             await asyncio.sleep(0.3)
 
 
@@ -188,4 +187,5 @@ async def tick() -> None:
     id="stamina_notice_push",
 )
 async def _scheduled_tick() -> None:
+    """每6分钟检查体力是否达到设定阈值"""
     await tick()

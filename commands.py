@@ -36,7 +36,7 @@ sv_threshold = SV("ww设置提醒阈值", priority=1)
 
 XW_MISSING = (
     "❌ 未检测到可用的 XutheringWavesUID\n"
-    "本插件只借用它的账号与体力接口，请先安装/启用 XutheringWavesUID 后重试"
+    "请先安装/启用 XutheringWavesUID 后重试"
 )
 
 
@@ -80,7 +80,7 @@ def _fmt_ts(ts: int) -> str:
 def _row_text(row: WavesStaminaNotice, mark: str = "") -> str:
     crazy = "，🔥催命开启" if row.crazy == "on" else ""
     return (
-        f"{mark}{row.target_label}：阈值 {row.threshold}"
+        f"{mark}{row.target_label}（记录#{row.id}）：阈值 {row.threshold}"
         f"{crazy}，下次检查 {_fmt_ts(row.next_check_ts)}"
     )
 
@@ -89,7 +89,7 @@ def _rows_text(rows: List[WavesStaminaNotice], ctx: Tuple[str, str, str]) -> str
     ctx_type, ctx_id, _ = ctx
     lines = []
     for row in rows:
-        mark = "▶ " if (row.target_type == ctx_type and row.target_id == ctx_id) else "· "
+        mark = "● " if (row.target_type == ctx_type and row.target_id == ctx_id) else "· "
         lines.append(_row_text(row, mark))
     return "\n".join(lines)
 
@@ -141,12 +141,8 @@ async def open_notice(bot: Bot, ev: Event):
     ]
     if cur >= threshold:
         lines.append("⚠️ 当前体力已达阈值，本次不重复推送；清完体力后会自动开始计时\n")
-    lines.append(
-        f"🔧 改阈值：[{prefix}设置提醒阈值240]\n"
-        f"🔧 关闭{label}：[{prefix}关闭体力提醒]"
-    )
     logger.info(
-        f"[体力提醒] 开启 uid={uid} user={user_id} target={target_type}:{target_id or '-'}"
+        f"[鸣潮体力提醒] 开启 uid={uid} user={user_id} target={target_type}:{target_id or '-'}"
     )
     return await bot.send("".join(lines))
 
@@ -169,11 +165,9 @@ async def close_notice(bot: Bot, ev: Event):
 
     rest = await WavesStaminaNotice.list_rows(user_id, ev.bot_id, uid)
     logger.info(
-        f"[体力提醒] 关闭 uid={uid} target={target_type}:{target_id or '-'} 剩余 {len(rest)} 条"
+        f"[鸣潮体力提醒] 关闭 uid={uid} target={target_type}:{target_id or '-'} 剩余 {len(rest)} 条"
     )
     lines = [f"❌ 已关闭{label}的体力提醒"]
-    if rest:
-        lines.append("\n\n📋 其它目标仍然开启：\n" + _rows_text(rest, _ctx(ev)))
     return await bot.send("".join(lines))
 
 
@@ -186,7 +180,7 @@ async def close_all(bot: Bot, ev: Event):
     count = await WavesStaminaNotice.delete_all(user_id, ev.bot_id, uid)
     if not count:
         return await bot.send("❌ 你当前没有任何体力提醒")
-    logger.info(f"[体力提醒] 关闭全部 uid={uid} user={user_id} count={count}")
+    logger.info(f"[鸣潮体力提醒] 关闭全部 uid={uid} user={user_id} count={count}")
     return await bot.send(f"❌ 已关闭全部体力提醒（共 {count} 个目标，含催命模式）")
 
 
@@ -209,7 +203,6 @@ async def open_crazy(bot: Bot, ev: Event):
     if record is None:
         return await bot.send(
             f"❌ 你还没有开启{label}体力提醒\n"
-            f"🔧 发送 [{xw_bridge.xw_prefix()}开启体力提醒] 即可开启"
         )
 
     await WavesStaminaNotice.set_fields(
@@ -218,11 +211,10 @@ async def open_crazy(bot: Bot, ev: Event):
         next_check_ts=int(time.time()),
         last_push_ts=0,
     )
-    logger.info(f"[体力提醒] 开启催命 uid={uid} target={target_type}:{target_id or '-'}")
+    logger.info(f"[鸣潮体力提醒] 开启催命 uid={uid} target={target_type}:{target_id or '-'}")
     return await bot.send(
         f"✅ 已开启{label}催命模式\n"
         f"⏰体力达到阈值 {record.threshold} 后，每 {cfg.crazy_minutes()} 分钟提醒一次\n"
-        f"🔧 发送 [{xw_bridge.xw_prefix()}关闭催命模式] 可关闭"
     )
 
 
@@ -244,7 +236,7 @@ async def close_crazy(bot: Bot, ev: Event):
         crazy="off",
         next_check_ts=int(time.time()) + 60,
     )
-    logger.info(f"[体力提醒] 关闭催命 uid={uid} target={target_type}:{target_id or '-'}")
+    logger.info(f"[鸣潮体力提醒] 关闭催命 uid={uid} target={target_type}:{target_id or '-'}")
     return await bot.send(f"❌ 已关闭{label}催命模式，体力提醒仍然保留")
 
 
@@ -292,7 +284,7 @@ async def set_threshold(bot: Bot, ev: Event):
         last_error="",
     )
     logger.info(
-        f"[体力提醒] 设置阈值 uid={uid} target={target_type}:{target_id or '-'} -> {value}"
+        f"[鸣潮体力提醒] 设置阈值 uid={uid} target={target_type}:{target_id or '-'} -> {value}"
     )
     return await bot.send(
         f"✅ {label}提醒阈值已设置为 {value}（当前体力 {cur}）"
@@ -313,11 +305,10 @@ async def show_status(bot: Bot, ev: Event):
     if not rows:
         return await bot.send(
             "❌ 当前未开启体力提醒\n"
-            f"🔧 发送 [{xw_bridge.xw_prefix()}开启体力提醒] 即可开启"
         )
 
     lines = [
-        "📋 体力提醒状态（▶ 为当前会话）\n",
+        "📋 体力提醒状态（● 为当前会话）\n",
         _rows_text(rows, ctx) + "\n",
     ]
     total = sum(r.push_count or 0 for r in rows)
