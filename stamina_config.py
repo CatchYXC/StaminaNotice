@@ -59,3 +59,13 @@ def recheck_minutes() -> int:
 
 def threshold_max() -> int:
     return _as_int(get_conf("ThresholdMax"), 240, 1)
+
+
+def push_image() -> bool:
+    """提醒是否渲染成图片推送（关掉就一直发纯文字）。"""
+    return bool(get_conf("PushImage", True))
+
+
+def debug_enabled() -> bool:
+    """调试模式：解锁「测试推送」指令，并打印判定明细日志。"""
+    return bool(get_conf("DebugMode", False))

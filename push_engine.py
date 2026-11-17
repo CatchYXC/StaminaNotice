@@ -17,15 +17,16 @@
 
 import asyncio
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from gsuid_core.aps import scheduler
 from gsuid_core.logger import logger
 
 from . import stamina_config as cfg
 from .models import WavesStaminaNotice
+from .render import CardData, build_push_image
 from .sender import send_push
-from .xw_bridge import fetch_energy
+from .xw_bridge import StaminaSnapshot, enrich_snapshot, fetch_snapshot
 
 POINT_SECONDS = 360  # 鸣潮体力：每 6 分钟恢复 1 点
 CAP_DEFAULT = 240
@@ -50,12 +51,14 @@ def compute_next_check(
     return now + POINT_SECONDS
 
 
-def _build_text(record: WavesStaminaNotice, cur: int, threshold: int, crazy: bool) -> str:
+def _build_text(
+    record: WavesStaminaNotice, snap: StaminaSnapshot, threshold: int, crazy: bool
+) -> str:
     head = "🔥[鸣潮] 催命提醒" if crazy else "✅[鸣潮] 体力提醒"
     lines = [
         f"{head}\n",
         f"🌜您的结晶波片已达到设定阈值（UID:{record.uid}）\n",
-        f"🕒当前体力：{cur} / 阈值：{threshold}\n",
+        f"🕒当前体力：{snap.cur} / 阈值：{threshold}\n",
     ]
     if crazy:
         lines.append(f"⏰催命模式开启中，{cfg.crazy_minutes()} 分钟后仍未清理会再次提醒\n")
@@ -64,8 +67,115 @@ def _build_text(record: WavesStaminaNotice, cur: int, threshold: int, crazy: boo
     return "".join(lines)
 
 
-async def _decide_row(record: WavesStaminaNotice, cur: int, refresh_ts: int, now: int) -> dict:
+def _build_card(
+    record: WavesStaminaNotice,
+    snap: StaminaSnapshot,
+    threshold: int,
+    crazy: bool,
+    test: bool = False,
+) -> CardData:
+    return CardData(
+        uid=record.uid,
+        cur=snap.cur,
+        total=snap.total or CAP_DEFAULT,
+        threshold=threshold,
+        refresh_ts=snap.refresh_ts,
+        role_name=snap.role_name,
+        store_cur=snap.store_cur,
+        store_total=snap.store_total,
+        live_cur=snap.live_cur,
+        live_total=snap.live_total,
+        crazy=crazy,
+        crazy_minutes=cfg.crazy_minutes(),
+        test=test,
+    )
+
+
+async def _push_row(
+    record: WavesStaminaNotice, snap: StaminaSnapshot, threshold: int, crazy: bool
+) -> bool:
+    """发一条提醒：优先发渲染出来的图片，失败则退回纯文字。"""
+    text = _build_text(record, snap, threshold, crazy)
+    image: Optional[bytes] = None
+    if cfg.push_image():
+        try:
+            # 结晶单质 国内服的 daily 接口不给，只在真要出图时才补一次 base_info
+            await enrich_snapshot(snap, record.user_id, record.bot_id)
+            image = await build_push_image(_build_card(record, snap, threshold, crazy))
+        except Exception as e:
+            # 渲染链上任何一环出问题都只降级成文字，绝不让推送本身失败
+            logger.exception(f"[鸣潮体力提醒] 出图失败，改发文字 uid={record.uid}: {e}")
+            image = None
+    return await send_push(record, text, image)
+
+
+def _build_test_text(
+    record: WavesStaminaNotice,
+    snap: StaminaSnapshot,
+    threshold: int,
+    has_image: bool,
+) -> str:
+    """测试推送的伴随文字：说明是调试消息，并交代图片有没有出来。"""
+    lines = [
+        "🧪[鸣潮] 测试推送\n",
+        f"🌜DEBUG 用的预览消息，可直接忽略（UID:{record.uid}）\n",
+        f"🕒当前结晶波片：{snap.cur} / {snap.total or CAP_DEFAULT}，阈值：{threshold}\n",
+        "📅本条不写入计时、不计入推送次数，正式提醒照旧\n",
+    ]
+    if cfg.push_image() and not has_image:
+        lines.append("⚠️图片渲染失败，本条已退回纯文字（原因见核心日志的「出图失败」）\n")
+    return "".join(lines)
+
+
+async def push_test(
+    record: WavesStaminaNotice,
+    snap: StaminaSnapshot,
+    threshold: int,
+) -> bool:
+    """调试用：立刻按正式样式发一条，**不触碰数据库**。
+
+    ``record`` 是内存里临时拼的行（没有主键），只用来确定投递目标；
+    和正式推送共用 ``send_push`` / 渲染链，所以能完整验证「图片能不能出来、
+    群里会不会 @ 到人」。
+    """
+    crazy = record.crazy == "on" and cfg.crazy_enabled()
+    image: Optional[bytes] = None
+    if cfg.push_image():
+        try:
+            await enrich_snapshot(snap, record.user_id, record.bot_id)
+            image = await build_push_image(
+                _build_card(record, snap, threshold, crazy, test=True)
+            )
+        except Exception as e:
+            logger.exception(f"[鸣潮体力提醒] 测试推送出图失败 uid={record.uid}: {e}")
+            image = None
+
+    ok = await send_push(record, _build_test_text(record, snap, threshold, bool(image)), image)
+    logger.info(
+        f"[鸣潮体力提醒][调试] 测试推送 uid={record.uid} "
+        f"target={record.target_type}:{record.target_id or '-'} "
+        f"体力={snap.cur}/{threshold} 图片={'是' if image else '否'} 结果={'成功' if ok else '失败'}"
+    )
+    return ok
+    image: Optional[bytes] = None
+    if cfg.push_image():
+        try:
+            # 结晶单质 国内服的 daily 接口不给，只在真要出图时才补一次 base_info
+            await enrich_snapshot(snap, record.user_id, record.bot_id)
+            image = await build_push_image(_build_card(record, snap, threshold, crazy))
+        except Exception as e:
+            # 渲染链上任何一环出问题都只降级成文字，绝不让推送本身失败
+            logger.exception(f"[鸣潮体力提醒] 出图失败，改发文字 uid={record.uid}: {e}")
+            image = None
+    return await send_push(record, text, image)
+
+
+async def _decide_row(
+    record: WavesStaminaNotice, snap: StaminaSnapshot, now: int
+) -> dict:
     """针对单行算出要写回的字段（含是否已推送）。"""
+    cur = snap.cur
+    refresh_ts = snap.refresh_ts or 0
     threshold = record.threshold or CAP_DEFAULT
     crazy = record.crazy == "on" and cfg.crazy_enabled()
     updates: dict = {"last_energy": cur, "last_error": "", "fail_count": 0}
@@ -73,13 +183,13 @@ async def _decide_row(record: WavesStaminaNotice, cur: int, refresh_ts: int, now
     if cur < threshold:
         # 体力已回落（用户清过体力）→ 允许下次满体力时重新提醒
         updates["last_push_ts"] = 0
-        updates["next_check_ts"] = compute_next_check(now, cur, threshold, refresh_ts or 0)
+        updates["next_check_ts"] = compute_next_check(now, cur, threshold, refresh_ts)
         return updates
 
     if crazy:
         gap = cfg.crazy_minutes() * 60
         if now - (record.last_push_ts or 0) >= max(gap - 30, 0):
-            if await send_push(record, _build_text(record, cur, threshold, True)):
+            if await _push_row(record, snap, threshold, True):
                 updates["last_push_ts"] = now
                 updates["push_count"] = (record.push_count or 0) + 1
         updates["next_check_ts"] = now + gap
@@ -88,7 +198,7 @@ async def _decide_row(record: WavesStaminaNotice, cur: int, refresh_ts: int, now
     # 普通模式：只有「之前没推过」或「上次采样还在阈值下」才推
     last_push = record.last_push_ts or 0
     if last_push <= 0 or (record.last_energy or -1) < threshold:
-        if await send_push(record, _build_text(record, cur, threshold, False)):
+        if await _push_row(record, snap, threshold, False):
             updates["last_push_ts"] = now
             updates["push_count"] = (record.push_count or 0) + 1
     updates["next_check_ts"] = now + cfg.recheck_minutes() * 60
@@ -103,13 +213,13 @@ async def _check_bucket(
     now: int,
 ) -> None:
     """一个 UID 的全部目标行，共用一次采样。"""
-    cur, refresh_ts, err = await fetch_energy(uid, user_id, bot_id)
+    snap, err = await fetch_snapshot(uid, user_id, bot_id)
     rows = await WavesStaminaNotice.list_by_uid(user_id, bot_id, uid)
     if not rows:
         return
 
     # 采样失败：全部行一起退避，避免每轮都打接口
-    if cur is None:
+    if snap is None:
         for row in rows:
             await WavesStaminaNotice.set_fields(
                 row.id,
@@ -123,13 +233,22 @@ async def _check_bucket(
         )
         return
 
+    cur = snap.cur
     pushed: List[str] = []
     for row in rows:
         try:
-            updates = await _decide_row(row, cur, refresh_ts or 0, now)
+            updates = await _decide_row(row, snap, now)
         except Exception as e:
             logger.exception(f"[鸣潮体力提醒] 判定失败 uid={uid} row={row.id}: {e}")
             continue
+        if cfg.debug_enabled():
+            logger.info(
+                f"[鸣潮体力提醒][调试] uid={uid} row={row.id} "
+                f"{row.target_type}:{row.target_id or '-'} "
+                f"体力={cur}/{snap.total} 阈值={row.threshold} "
+                f"上次采样={row.last_energy} 上次推送={row.last_push_ts or 0} "
+                f"→ 写回 {updates}"
+            )
         await WavesStaminaNotice.set_fields(row.id, **updates)
         if updates.get("last_push_ts") == now:
             pushed.append(row.target_label)

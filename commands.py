@@ -6,6 +6,7 @@
     ww开启催命模式 / ww关闭催命模式      （同样只作用于当前会话）
     ww设置提醒阈值240 / ww设置提醒阈值   （不带数字=查状态）
     ww体力提醒状态
+    ww测试推送                           （调试用，需在面板打开「调试模式」）
 
 在设计上，数据库是「一个推送目标一行」，所以这里的每条指令都只改
 当前会话对应的那一条记录：群里发就改群里的阈值，私聊发就改私聊的阈值。
@@ -26,17 +27,22 @@ from .models import (
     TARGET_PRIVATE,
     WavesStaminaNotice,
 )
-from .push_engine import compute_next_check
+from .push_engine import compute_next_check, push_test
 
 sv_notice = SV("ww体力提醒")
 sv_crazy = SV("ww催命模式")
 # priority=1：XutheringWavesUID 的「waves配置」用 on_prefix("设置", block=True)
 # 且 priority=3，会把「设置XXX」整段吞掉。这里必须抢在它前面并 block。
 sv_threshold = SV("ww设置提醒阈值", priority=1)
+sv_debug = SV("ww测试推送", priority=1)
 
 XW_MISSING = (
     "❌ 未检测到可用的 XutheringWavesUID\n"
     "请先安装/启用 XutheringWavesUID 后重试"
+)
+DEBUG_OFF = (
+    "❌ 调试模式未开启，[ww测试推送] 不可用\n"
+    "🔧 网页面板 → 鸣潮体力提醒 → 打开「调试模式」后重试"
 )
 
 
@@ -312,6 +318,9 @@ async def show_status(bot: Bot, ev: Event):
     ]
     total = sum(r.push_count or 0 for r in rows)
     lines.append(f"\n📊 累计推送：{total} 次")
+    lines.append(f"\n🖼️ 推送方式：{'图片卡片' if cfg.push_image() else '纯文字'}")
+    if cfg.debug_enabled():
+        lines.append(f"\n🧪 调试模式已开启，可发送 [{xw_bridge.xw_prefix()}测试推送] 试发一条")
     errors = [r for r in rows if r.last_error]
     if errors:
         lines.append(f"\n⚠️ {errors[0].target_label} 上次取数错误：{errors[0].last_error}")
@@ -319,3 +328,59 @@ async def show_status(bot: Bot, ev: Event):
         f"\n🔧 改本会话阈值：[{xw_bridge.xw_prefix()}设置提醒阈值240]"
     )
     return await bot.send("".join(lines))
+
+
+@sv_debug.on_fullmatch(
+    ("测试推送", "测试体力提醒", "体力提醒测试", "debug推送"),
+    block=True,
+)
+async def debug_push(bot: Bot, ev: Event):
+    """调试用：立刻往当前会话发一条提醒，不动计时与推送次数。
+
+    和定时任务走同一条渲染/发送链路（`push_test` → `send_push`），
+    所以能直接验证「图能不能出、群里会不会 @ 到人、bot 有没有配好」。
+    """
+    if not cfg.debug_enabled():
+        return await bot.send(DEBUG_OFF)
+
+    admin_err = _group_admin_error(ev)
+    if admin_err:
+        return await bot.send(admin_err)
+
+    user_id, uid, err = await _prepare(ev)
+    if err:
+        return await bot.send(err)
+
+    snap, fetch_err = await xw_bridge.fetch_snapshot(uid, user_id, ev.bot_id)
+    if snap is None:
+        return await bot.send(f"❌ 测试推送失败：{fetch_err}")
+
+    target_type, target_id, label = _ctx(ev)
+    row = await WavesStaminaNotice.get_row(
+        user_id, ev.bot_id, uid, target_type, target_id
+    )
+    threshold = (row.threshold if row and row.threshold else cfg.threshold_max())
+
+    # 内存里临时拼一行用于投递（不落库，id 为空）
+    record = WavesStaminaNotice(
+        user_id=user_id,
+        bot_id=ev.bot_id,
+        uid=uid,
+        bot_self_id=ev.bot_self_id or "",
+        target_type=target_type,
+        target_id=target_id or "",
+        threshold=threshold,
+        crazy=row.crazy if row is not None else "off",
+    )
+
+    ok = await push_test(record, snap, threshold)
+    if not ok:
+        return await bot.send(
+            "❌ 测试推送发送失败（日志里有具体原因）\n"
+            "💡 常见原因：没有可用的 bot、目标 ID 为空、平台发送频率限制"
+        )
+    # 成功时不再补一条消息：卡片本身已经发到当前会话了
+    logger.info(
+        f"[鸣潮体力提醒] 调试测试推送 -> {label} uid={uid} "
+        f"体力={snap.cur} 阈值={threshold} 订阅行={'有' if row else '无'}"
+    )
