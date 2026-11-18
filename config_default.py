@@ -44,8 +44,8 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
     ),
     "PushImage": GsBoolConfig(
         "推送图片",
-        "开启后提醒渲染成与「每日」一致的体力卡片图片推送（复用 XutheringWavesUID 的素材）；"
-        "渲染失败会自动退回纯文字，关闭则一直发文字",
+        "开启后提醒会附上 XutheringWavesUID「每日」那张体力图（直接调它的绘图入口，"
+        "版式与 ww每日 完全一致）；取图失败会自动退回纯文字，关闭则一直发文字",
         True,
     ),
     "DebugMode": GsBoolConfig(

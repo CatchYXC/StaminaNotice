@@ -4,7 +4,8 @@
 * ``target_type == 'private'`` → 发到 ``user_id``
 * ``target_type == 'group'``   → 发到 ``target_id``（群号），末尾 @订阅者本人
 
-图片由 ``render.build_push_image`` 渲染好传进来；传 None 时退化成纯文字。
+图片由 ``xw_bridge.fetch_daily_image`` 从 XutheringWavesUID 的「每日」里拿回来；
+传 None 时退化成纯文字。
 
 只推给「订阅时记录下来的那一个 bot」，不像某些实现那样遍历 ``gss.active_bot``
 全量广播——多 bot 场景下那样会重复发 N 份。
@@ -45,7 +46,7 @@ async def send_push(
 ) -> bool:
     """把提醒发到这一行对应的目标，成功返回 True。
 
-    ``image`` 有值时先发图再跟一段短文字；图片渲染失败时调用方传 None，
+    ``image`` 有值时先发图再跟一段短文字；图片没拿到时调用方传 None，
     这里就只发文字，行为与旧版本一致。
     """
     target_type, target_id = _target(record)

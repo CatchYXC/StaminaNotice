@@ -318,7 +318,7 @@ async def show_status(bot: Bot, ev: Event):
     ]
     total = sum(r.push_count or 0 for r in rows)
     lines.append(f"\n📊 累计推送：{total} 次")
-    lines.append(f"\n🖼️ 推送方式：{'图片卡片' if cfg.push_image() else '纯文字'}")
+    lines.append(f"\n🖼️ 推送方式：{'每日图片 + 文字' if cfg.push_image() else '纯文字'}")
     if cfg.debug_enabled():
         lines.append(f"\n🧪 调试模式已开启，可发送 [{xw_bridge.xw_prefix()}测试推送] 试发一条")
     errors = [r for r in rows if r.last_error]
@@ -337,8 +337,8 @@ async def show_status(bot: Bot, ev: Event):
 async def debug_push(bot: Bot, ev: Event):
     """调试用：立刻往当前会话发一条提醒，不动计时与推送次数。
 
-    和定时任务走同一条渲染/发送链路（`push_test` → `send_push`），
-    所以能直接验证「图能不能出、群里会不会 @ 到人、bot 有没有配好」。
+    和定时任务走同一条取图/发送链路（`push_test` → `fetch_daily_image` →
+    `send_push`），所以能直接验证「图能不能出、群里会不会 @ 到人、bot 有没有配好」。
     """
     if not cfg.debug_enabled():
         return await bot.send(DEBUG_OFF)

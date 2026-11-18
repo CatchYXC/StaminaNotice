@@ -24,9 +24,8 @@ from gsuid_core.logger import logger
 
 from . import stamina_config as cfg
 from .models import WavesStaminaNotice
-from .render import CardData, build_push_image
 from .sender import send_push
-from .xw_bridge import StaminaSnapshot, enrich_snapshot, fetch_snapshot
+from .xw_bridge import StaminaSnapshot, fetch_daily_image, fetch_snapshot
 
 POINT_SECONDS = 360  # 鸣潮体力：每 6 分钟恢复 1 点
 CAP_DEFAULT = 240
@@ -67,45 +66,31 @@ def _build_text(
     return "".join(lines)
 
 
-def _build_card(
-    record: WavesStaminaNotice,
-    snap: StaminaSnapshot,
-    threshold: int,
-    crazy: bool,
-    test: bool = False,
-) -> CardData:
-    return CardData(
-        uid=record.uid,
-        cur=snap.cur,
-        total=snap.total or CAP_DEFAULT,
-        threshold=threshold,
-        refresh_ts=snap.refresh_ts,
-        role_name=snap.role_name,
-        store_cur=snap.store_cur,
-        store_total=snap.store_total,
-        live_cur=snap.live_cur,
-        live_total=snap.live_total,
-        crazy=crazy,
-        crazy_minutes=cfg.crazy_minutes(),
-        test=test,
-    )
+async def _fetch_image(record: WavesStaminaNotice) -> Tuple[Optional[bytes], str]:
+    """取一张「每日」的体力图；没开图片开关时返回 ``(None, "")``。
+
+    整条链路上任何一环出问题都只降级成文字，绝不让推送本身失败。
+    """
+    if not cfg.push_image():
+        return None, ""
+    try:
+        return await fetch_daily_image(
+            record.uid,
+            record.user_id,
+            record.bot_id,
+            record.bot_self_id or "",
+        )
+    except Exception as e:
+        logger.exception(f"[鸣潮体力提醒] 取每日图片异常 uid={record.uid}: {e}")
+        return None, f"{type(e).__name__}: {e}"[:120]
 
 
 async def _push_row(
     record: WavesStaminaNotice, snap: StaminaSnapshot, threshold: int, crazy: bool
 ) -> bool:
-    """发一条提醒：优先发渲染出来的图片，失败则退回纯文字。"""
+    """发一条提醒：配「每日」那张图，图出不来就只发文字。"""
     text = _build_text(record, snap, threshold, crazy)
-    image: Optional[bytes] = None
-    if cfg.push_image():
-        try:
-            # 结晶单质 国内服的 daily 接口不给，只在真要出图时才补一次 base_info
-            await enrich_snapshot(snap, record.user_id, record.bot_id)
-            image = await build_push_image(_build_card(record, snap, threshold, crazy))
-        except Exception as e:
-            # 渲染链上任何一环出问题都只降级成文字，绝不让推送本身失败
-            logger.exception(f"[鸣潮体力提醒] 出图失败，改发文字 uid={record.uid}: {e}")
-            image = None
+    image, _ = await _fetch_image(record)
     return await send_push(record, text, image)
 
 
@@ -114,6 +99,7 @@ def _build_test_text(
     snap: StaminaSnapshot,
     threshold: int,
     has_image: bool,
+    err: str = "",
 ) -> str:
     """测试推送的伴随文字：说明是调试消息，并交代图片有没有出来。"""
     lines = [
@@ -123,7 +109,8 @@ def _build_test_text(
         "📅本条不写入计时、不计入推送次数，正式提醒照旧\n",
     ]
     if cfg.push_image() and not has_image:
-        lines.append("⚠️图片渲染失败，本条已退回纯文字（原因见核心日志的「出图失败」）\n")
+        detail = f"：{err}" if err else "（原因见核心日志）"
+        lines.append(f"⚠️每日图片没拿到，本条已退回纯文字{detail}\n")
     return "".join(lines)
 
 
@@ -135,39 +122,19 @@ async def push_test(
     """调试用：立刻按正式样式发一条，**不触碰数据库**。
 
     ``record`` 是内存里临时拼的行（没有主键），只用来确定投递目标；
-    和正式推送共用 ``send_push`` / 渲染链，所以能完整验证「图片能不能出来、
-    群里会不会 @ 到人」。
+    和正式推送共用 ``send_push`` + 取图链路，所以能完整验证
+    「图能不能出来、群里会不会 @ 到人」。
     """
-    crazy = record.crazy == "on" and cfg.crazy_enabled()
-    image: Optional[bytes] = None
-    if cfg.push_image():
-        try:
-            await enrich_snapshot(snap, record.user_id, record.bot_id)
-            image = await build_push_image(
-                _build_card(record, snap, threshold, crazy, test=True)
-            )
-        except Exception as e:
-            logger.exception(f"[鸣潮体力提醒] 测试推送出图失败 uid={record.uid}: {e}")
-            image = None
-
-    ok = await send_push(record, _build_test_text(record, snap, threshold, bool(image)), image)
+    image, err = await _fetch_image(record)
+    ok = await send_push(
+        record, _build_test_text(record, snap, threshold, bool(image), err), image
+    )
     logger.info(
         f"[鸣潮体力提醒][调试] 测试推送 uid={record.uid} "
         f"target={record.target_type}:{record.target_id or '-'} "
         f"体力={snap.cur}/{threshold} 图片={'是' if image else '否'} 结果={'成功' if ok else '失败'}"
     )
     return ok
-    image: Optional[bytes] = None
-    if cfg.push_image():
-        try:
-            # 结晶单质 国内服的 daily 接口不给，只在真要出图时才补一次 base_info
-            await enrich_snapshot(snap, record.user_id, record.bot_id)
-            image = await build_push_image(_build_card(record, snap, threshold, crazy))
-        except Exception as e:
-            # 渲染链上任何一环出问题都只降级成文字，绝不让推送本身失败
-            logger.exception(f"[鸣潮体力提醒] 出图失败，改发文字 uid={record.uid}: {e}")
-            image = None
-    return await send_push(record, text, image)
 
 
 async def _decide_row(

@@ -17,7 +17,6 @@
 import sys
 import importlib
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterator, Optional, Tuple
 
 from gsuid_core.logger import logger
@@ -31,7 +30,8 @@ _REQUIRED: dict = {
     "utils.api.model": ("DailyData", "AccountBaseInfo"),
     "utils.api.launcher_chain": ("fetch_launcher_panel",),
     "utils.at_help": ("ruser_id",),
-    "utils.resource.RESOURCE_PATH": ("ROLE_PILE_PATH",),
+    # 推送图片直接复用「每日」的绘图入口，不再自己拼图
+    "wutheringwaves_stamina.draw_waves_stamina": ("draw_stamina_img",),
 }
 
 _CACHE: dict = {}
@@ -170,19 +170,12 @@ def xw_prefix() -> str:
 
 @dataclass
 class StaminaSnapshot:
-    """一次采样的全部展示用数据（图片渲染要用，判定只用 cur/refresh_ts）。"""
+    """一次体力采样。判定只用 ``cur`` / ``refresh_ts``。"""
 
     uid: str
     cur: int
     total: int = 240
     refresh_ts: int = 0
-    role_name: str = ""
-    store_cur: Optional[int] = None
-    store_total: Optional[int] = None
-    live_cur: Optional[int] = None
-    live_total: Optional[int] = None
-    from_sdk: bool = False
-    enrich_tried: bool = False
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -199,10 +192,9 @@ async def fetch_snapshot(
     user_id: str,
     bot_id: str,
 ) -> Tuple[Optional[StaminaSnapshot], str]:
-    """取一次体力快照（含渲染要用的角色名 / 活跃度 / 结晶单质）。
+    """取一次体力快照（``cur`` + 体力回满时间戳）。
 
     只打一次接口：国服走 ``get_daily_info``，国际服走启动器面板。
-    结晶单质在国内接口里常常缺失，由 :func:`enrich_snapshot` 在真正要出图时补。
     """
     try:
         api = _api()
@@ -218,19 +210,11 @@ async def fetch_snapshot(
             energy = getattr(panel, "energy", None)
             if energy is None:
                 return None, "启动器面板缺少体力数据"
-            base = getattr(panel, "base", None)
-            liveness = getattr(panel, "liveness", None)
             return StaminaSnapshot(
                 uid=str(uid),
                 cur=_safe_int(getattr(energy, "cur", None)) or 0,
                 total=_safe_int(getattr(energy, "total", None)) or 240,
                 refresh_ts=_safe_int(getattr(energy, "refreshTimeStamp", None)) or 0,
-                role_name=str(getattr(base, "name", "") or ""),
-                store_cur=_safe_int(getattr(base, "storeEnergy", None)),
-                store_total=_safe_int(getattr(base, "storeEnergyLimit", None)),
-                live_cur=_safe_int(getattr(liveness, "cur", None)),
-                live_total=_safe_int(getattr(liveness, "total", None)),
-                from_sdk=True,
             ), ""
 
         cookie, err = await api.check_self_login(uid, user_id, bot_id)
@@ -250,56 +234,86 @@ async def fetch_snapshot(
         energy = getattr(daily, "energyData", None)
         if energy is None:
             return None, "每日信息缺少体力数据"
-
-        store = getattr(daily, "storeEnergyData", None)
-        liveness = getattr(daily, "livenessData", None)
-        return (
-            StaminaSnapshot(
-                uid=str(getattr(daily, "roleId", None) or uid),
-                cur=_safe_int(getattr(energy, "cur", None)) or 0,
-                total=_safe_int(getattr(energy, "total", None)) or 240,
-                refresh_ts=_safe_int(getattr(energy, "refreshTimeStamp", None)) or 0,
-                role_name=str(getattr(daily, "roleName", "") or ""),
-                store_cur=_safe_int(getattr(store, "cur", None)) if store else None,
-                store_total=_safe_int(getattr(store, "total", None)) if store else None,
-                live_cur=_safe_int(getattr(liveness, "cur", None)),
-                live_total=_safe_int(getattr(liveness, "total", None)),
-            ),
-            "",
-        )
+        return StaminaSnapshot(
+            uid=str(getattr(daily, "roleId", None) or uid),
+            cur=_safe_int(getattr(energy, "cur", None)) or 0,
+            total=_safe_int(getattr(energy, "total", None)) or 240,
+            refresh_ts=_safe_int(getattr(energy, "refreshTimeStamp", None)) or 0,
+        ), ""
     except Exception as e:
         logger.exception("[鸣潮体力提醒] 取体力数据异常")
         return None, f"获取体力数据异常：{type(e).__name__}"
 
 
-async def enrich_snapshot(
-    snap: StaminaSnapshot,
+class PushEvent:
+    """伪造一个「够用」的 Event，喂给对方的绘图入口。
+
+    对方 ``draw_stamina_img(bot, ev)`` 只用到这几个字段：
+    ``user_id`` / ``bot_id`` / ``bot_self_id`` / ``at`` / ``sender``。
+    ``at`` 留空 -> ``ruser_id(ev)`` 回落成 ``user_id``；
+    ``sender`` 留空字典 -> ``get_event_avatar`` 走「按 user_id 取 QQ 头像」或
+    角色头像兜底，不会因为拿不到消息体而炸。
+    """
+
+    def __init__(self, user_id: str, bot_id: str, bot_self_id: str = "") -> None:
+        self.user_id = user_id
+        self.bot_id = bot_id
+        self.bot_self_id = bot_self_id or ""
+        self.at = ""
+        self.sender: dict = {}
+        self.group_id = None
+        self.text = ""
+        self.raw_text = ""
+        self.msg = ""
+
+
+async def fetch_daily_image(
+    uid: str,
     user_id: str,
     bot_id: str,
-) -> None:
-    """出图前补齐结晶单质（国内服 ``get_daily_info`` 不给，要额外一次 base_info）。"""
-    if snap.enrich_tried or snap.from_sdk or snap.store_cur is not None:
-        return
-    snap.enrich_tried = True
-    try:
-        api = _api()
-        account_cls = _get("utils.api.model").AccountBaseInfo
-        cookie, _ = await api.check_self_login(snap.uid, user_id, bot_id)
-        if not cookie:
-            return
-        res = await api.get_base_info(snap.uid, cookie)
-        if not getattr(res, "success", False):
-            return
-        base = account_cls.model_validate(res.data)
-    except Exception as e:
-        logger.debug(f"[鸣潮体力提醒] 补齐账号信息失败（不影响推送）：{e}")
-        return
+    bot_self_id: str = "",
+) -> Tuple[Optional[bytes], str]:
+    """直接触发 XutheringWavesUID「每日」的绘图入口，把图片字节拿回来。
 
-    if snap.store_cur is None:
-        snap.store_cur = _safe_int(getattr(base, "storeEnergy", None))
-        snap.store_total = _safe_int(getattr(base, "storeEnergyLimit", None))
-    if not snap.role_name:
-        snap.role_name = str(getattr(base, "name", "") or "")
+    与其自己照着素材拼一张，不如复用对方的 ``draw_stamina_img``：
+    版式、素材、头像、背景/立绘配置全部和用户 `ww每日` 看到的一模一样。
+
+    注意：对方绘图时会顺手把这次查询写进它自己的 ``WavesStaminaRecord``
+    （``upsert_stamina_query``，记录查询时间与体力值），属于「真的查了一次」的
+    正常记账，不影响本插件的计时。
+
+    Returns:
+        (jpeg_bytes, err)。失败时 bytes 为 None，err 为可直出的中文原因。
+    """
+    try:
+        mod = _get("wutheringwaves_stamina.draw_waves_stamina")
+    except Exception as e:
+        logger.warning(f"[鸣潮体力提醒] 未找到「每日」绘图模块：{e}")
+        return None, f"未检测到 XutheringWavesUID 的每日绘图模块（{type(e).__name__}）"
+
+    ev = PushEvent(user_id, bot_id, bot_self_id)
+    try:
+        # bot 参数对方内部没用到，传 None 即可
+        res = await mod.draw_stamina_img(None, ev)
+    except Exception as e:
+        logger.exception(f"[鸣潮体力提醒] 调用每日绘图失败 uid={uid}")
+        return None, f"每日图片渲染异常：{type(e).__name__}"
+
+    if isinstance(res, (bytes, bytearray)):
+        return bytes(res), ""
+    if isinstance(res, str):
+        # 对方把「未绑定 / CK 失效 / 维护中」等直接以字符串返回
+        return None, res.strip() or "每日图片生成失败"
+
+    # 兜底：万一对方改了返回类型（PIL Image）
+    try:
+        import io
+
+        buf = io.BytesIO()
+        res.convert("RGB").save(buf, format="JPEG", quality=92)
+        return buf.getvalue(), ""
+    except Exception:
+        return None, "每日图片格式无法识别"
 
 
 async def fetch_energy(
@@ -317,35 +331,4 @@ async def fetch_energy(
     if snap is None:
         return None, None, err
     return snap.cur, snap.refresh_ts, ""
-
-
-def _module_root_dir(module: Any) -> Optional[Path]:
-    """从已解析的模块文件位置反推 ``XutheringWavesUID`` 包目录。"""
-    file = getattr(module, "__file__", None)
-    if not file:
-        return None
-    for parent in Path(file).resolve().parents:
-        if parent.name == XW_ROOT:
-            return parent
-    return None
-
-
-def package_root() -> Optional[Path]:
-    """XutheringWavesUID 包目录（图片渲染直接读它的 texture2d 与 fonts）。"""
-    for module in list(_CACHE.values()):
-        root = _module_root_dir(module)
-        if root is not None:
-            return root
-    # 缓存还没预热时的兜底：插件与对方通常装在同一个 plugins 目录下
-    sibling = Path(__file__).resolve().parent.parent / XW_ROOT
-    return sibling if sibling.is_dir() else None
-
-
-def pile_dir() -> Optional[Path]:
-    """立绘目录 ``resource/role_pile``；对方没下载资源时返回 None。"""
-    try:
-        path = Path(_get("utils.resource.RESOURCE_PATH").ROLE_PILE_PATH)
-    except Exception:
-        return None
-    return path if path.is_dir() else None
 

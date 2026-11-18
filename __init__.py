@@ -2,8 +2,9 @@
 
 与 XutheringWavesUID 同时安装即可使用：
 - 账号 / 绑定 / 体力数据：只读借用 XutheringWavesUID（见 xw_bridge.py）
+- 推送图片：直接调用对方「每日」的绘图入口，拿到图后自己配文
 - 提醒配置与推送状态：全部落在本插件自建表 WavesStaminaNotice
-- 不读取、不写入 XutheringWavesUID 的任何数据表
+- 除出图时对方自行记账（WavesStaminaRecord 的一次查询记录）外，不写对方的表
 """
 
 from gsuid_core.logger import logger
